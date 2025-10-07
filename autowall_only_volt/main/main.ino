@@ -112,18 +112,17 @@ void loop() {
     // Test: voltage control
 int rightSpeed, leftSpeed;
 
-  if (cm1 <= 25) {           // too close: turn LEFT (slow right, speed left)
-    rightSpeed = map(cm1, 0, 25,  128, 255);  // closer -> slower right
-    leftSpeed  = map(cm1, 0, 25, 255,  128);  // closer -> faster left
+  if (cm1 <= 25) {           // too close: turn LEFT (speed right, slow left)
+    rightSpeed = map(cm1, 0, 25,  255, 128);  // closer -> faster right
+    leftSpeed  = map(cm1, 0, 25, 128,  255);  // closer -> slower left
   } else if (cm1 >= 40) {    // too far: turn RIGHT (slow left, speed right)
-    // cap upper range to a realistic distance your sensor sees (e.g. 100 cm)
-    rightSpeed = map(cm1, 40, 100, 255,  128);  // further -> faster right
-    leftSpeed  = map(cm1, 40, 100,  128, 255);  // further -> slower left
+    rightSpeed = map(cm1, 40, 110, 128,  255);  // further -> slower right
+    leftSpeed  = map(cm1, 40, 110,  255, 128);  // further -> faster left
   } else {                   // 26..39 cm: go straight
     leftSpeed  = 255;
     rightSpeed = 255;
   }
-    drive(speed, lowVol, speed, lowVol, rightSpeed, rightSpeed);
+    drive(speed, lowVol, speed, lowVol, leftSpeed, rightSpeed);
 
     // Old code, with cooldown control
     // if (cm1 <= 25) {
