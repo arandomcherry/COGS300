@@ -107,22 +107,46 @@ void loop() {
   float cm1 = (duration1/2) / 29.1;
   float cm2 = (duration2/2) / 29.1;
 
-  if (autonomous_mode) {
+ 
 
     // Test: voltage control
-int rightSpeed, leftSpeed;
+// Tunables
+const int baseSpeed   = 255;   // try 200–230 if you’re saturating
+const int maxCorr     = 112;   // max differential added/subtracted
+const int tooCloseMax = 25;
+const int tooFarMin   = 40;
+const int farClamp    = 110;   // clamp distant readings
 
-  if (cm1 <= 25) {           // too close: turn LEFT (speed right, slow left)
-    rightSpeed = map(cm1, 0, 25,  255, 128);  // closer -> faster right
-    leftSpeed  = map(cm1, 0, 25, 128,  255);  // closer -> slower left
-  } else if (cm1 >= 40) {    // too far: turn RIGHT (slow left, speed right)
-    rightSpeed = map(cm1, 40, 110, 128,  255);  // further -> slower right
-    leftSpeed  = map(cm1, 40, 110,  255, 128);  // further -> faster left
-  } else {                   // 26..39 cm: go straight
-    leftSpeed  = 255;
-    rightSpeed = 255;
-  }
-    drive(speed, lowVol, speed, lowVol, leftSpeed, rightSpeed);
+int leftSpeed, rightSpeed;
+int cm = cm1;                  // raw sensor reading
+
+// Optional: clamp crazy far readings
+if (cm > farClamp) cm = farClamp;
+
+if (cm < tooCloseMax) {
+  // Too close: turn LEFT (slow left, speed up right)
+  // diff goes from maxCorr at 0 cm down to 0 at 25 cm  → continuous at 25
+  int diff = map(cm, 0, tooCloseMax, maxCorr, 0);
+  leftSpeed  = baseSpeed - diff;
+  rightSpeed = baseSpeed + diff;
+} else if (cm > tooFarMin) {
+  // Too far: turn RIGHT (speed up left, slow right)
+  // diff goes from 0 at 40 cm up to maxCorr at 110 cm → continuous at 40
+  int diff = map(cm, tooFarMin, farClamp, 0, maxCorr);
+  leftSpeed  = baseSpeed + diff;
+  rightSpeed = baseSpeed - diff;
+} else {
+  // In-range: go straight
+  leftSpeed  = baseSpeed;
+  rightSpeed = baseSpeed;
+}
+
+// Always keep within [0,255]
+leftSpeed  = constrain(leftSpeed,  0, 255);
+rightSpeed = constrain(rightSpeed, 0, 255);
+
+   if (autonomous_mode) {
+    drive(speed, lowVol, speed, lowVol, rightSpeed, leftSpeed);
 
     // Old code, with cooldown control
     // if (cm1 <= 25) {
@@ -149,13 +173,17 @@ int rightSpeed, leftSpeed;
     //   drive(speed, lowVol, speed, lowVol);
     //   forward_counter = max(forward_counter + 1, COOLDOWN_FORWARD_THRESHOLD);
     // }
-  } 
-  Serial.print("Side: ");  
+     } 
+      Serial.print("Side: ");  
   Serial.print(cm1);
-  Serial.print(" Front: ");  
-  Serial.print(cm2);
   Serial.println();  
-  delay(100);
+    Serial.print("Voltage Left: ");  
+  Serial.print(leftSpeed);
+      Serial.print("    Voltage Right: ");  
+  Serial.print(rightSpeed);
+  Serial.println();  
+  delay(1000);
+ 
   int leftEncoderVal = digitalRead(encleft);
   int rightEncoderVal = digitalRead(encright);
   // Serial.print('E');
