@@ -110,17 +110,20 @@ void loop() {
   if (autonomous_mode) {
 
     // Test: voltage control
+int rightSpeed, leftSpeed;
 
-    int vol1, vol2;
-    if (cm1 <= 25) {
-      vol1 = 255 - map(cm1, 0, 25, 64, 255);
-    } else if (cm1 >= 40) {
-      vol2 = map(cm1, 40, 255, 64, 255);
-    } else {
-      vol1 = 255;
-      vol2 = 255;
-    }
-    drive(speed, lowVol, speed, lowVol, vol1, vol2);
+  if (cm1 <= 25) {           // too close: turn LEFT (slow right, speed left)
+    rightSpeed = map(cm1, 0, 25,  128, 255);  // closer -> slower right
+    leftSpeed  = map(cm1, 0, 25, 255,  128);  // closer -> faster left
+  } else if (cm1 >= 40) {    // too far: turn RIGHT (slow left, speed right)
+    // cap upper range to a realistic distance your sensor sees (e.g. 100 cm)
+    rightSpeed = map(cm1, 40, 100, 255,  128);  // further -> faster right
+    leftSpeed  = map(cm1, 40, 100,  128, 255);  // further -> slower left
+  } else {                   // 26..39 cm: go straight
+    leftSpeed  = 255;
+    rightSpeed = 255;
+  }
+    drive(speed, lowVol, speed, lowVol, rightSpeed, rightSpeed);
 
     // Old code, with cooldown control
     // if (cm1 <= 25) {
