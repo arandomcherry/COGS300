@@ -1,363 +1,371 @@
-#define enA_1 10
-#define enA_2 11
+// ====== PINS ======
+#define enA_1 10  // PWM for RIGHT motor (see drive() mapping note below)
+#define enA_2 11  // PWM for LEFT motor
 #define in1_1 4
 #define in2_1 2
 #define in1_2 7
 #define in2_2 8
 #define encleft 12
 #define encright 13
-#define trig1 3
-#define trig2 6
+#define trig1 3  // side sensor (wall following)
+#define trig2 6  // front sensor
 #define echo1 5
 #define echo2 9
-//sensor 1 side, sensor 2 front
+
+// ====== WIFI / SERVER ======
 #include <WiFiS3.h>
+#include <math.h>
 IPAddress AP_IP(192, 168, 4, 1);
 IPAddress AP_GW(192, 168, 4, 1);
 IPAddress AP_SN(255, 255, 255, 0);
 
-int turning_counter = 0;
-int forward_counter = 0;
-//int COOLDOWN_TURNING_THRESHOLD = 3;
-//int COOLDOWN_FORWARD_THRESHOLD = 16;
-
-boolean autonomous_mode = 0;
-
-const float TARGET_CM         = 18.0; // desired distance from wall (sensor 1)
-const float DEAD_BAND         = 3.0;  // no turning if |error| <= this
-const float MAX_ERR           = 5.0; // clamp error used for scaling
-const int   MIN_TURN_CYCLES   = 1;    // shortest turn when error is small
-const int   MAX_TURN_CYCLES   = 3;    // longest turn when error is large
-
-const int FORWARD_COOLDOWN    = 6;    // Y: forward cycles required before next turn
-
-
-enum AutoState { FORWARDING, TURNING };
-AutoState auto_state = FORWARDING;
-
-int turn_cycles_left = 0;
-int forward_cooldown_left = 3;
-
-int speed = 255;
-int lowVol = 0;
-
 const char* ssid = "ARDUINO_FINAL_BOSS";  // open AP (no password)
 WiFiServer server(80);
 
+// ====== SERIAL ======
 const int SERIAL_BAUD = 115200;
 
-// Command bytes
+// ====== AUTONOMY TUNING ======
+// Wall following target on side sensor:
+const float TARGET_CM = 18.0;
+const float DEAD_BAND = 3.0;    // ignore tiny errors
+const float MAX_ERR_CM = 12.0;  // clamp error for scaling
+
+// Differential steering (voltage control):
+const int BASE_SPEED = 220;  // 0..255
+const int MAX_DIFF = 100;    // 0..255 (max differential)
+const float KP = 4.0;        // speed-per-cm (tweak with MAX_DIFF)
+
+// Burst + Cooldown:
+const int MIN_TURN_CYCLES = 1;
+const int MAX_TURN_CYCLES = 3;
+const int FORWARD_COOLDOWN = 2;  // straight cycles before next turn burst
+
+// --- Right-wall following behavior tweaks ---
+const bool HUG_RIGHT = true;        // keep true (right-hand wall)
+const bool USE_FRONT_STOP = false;  // still disabled per your request
+
+const float BREAK_COOLDOWN_ERR = 2.5;  // cm beyond DEAD_BAND to interrupt cooldown
+const float NEAR_CLAMP_CM = 3.0;       // clamp silly-near readings (ultrasonic min)
+
+// Track sign of the current burst (+1 turn right, -1 turn left, 0 none)
+int burst_dir = 0;
+
+inline int sgn(float x) {
+  return (x > 0) - (x < 0);
+}
+
+const float FRONT_STOP_CM = 15.0;  // used only when USE_FRONT_STOP = true
+
+const float FAR_CLAMP_CM = 60.0;               // clamp noisy long reads
+const unsigned long ECHO_TIMEOUT_US = 25000UL;  // ~4m max (HC-SR04-ish)
+
+
+// ====== STATE ======
+enum AutoState { AUTO_STEER_BURST,
+                 AUTO_COOLDOWN };
+AutoState auto_state = AUTO_COOLDOWN;
+
+int turn_cycles_left = 0;
+int cooldown_cycles_left = 0;
+bool autonomous_mode = false;
+
+// Keeps last commanded speeds for debug print
+int lastLeft = 0, lastRight = 0;
+
+// ====== COMMAND BYTES (kept from your code) ======
 const uint8_t CMD_W = 0b00000001;
-const uint8_t CMD_A = 0b00000100;
+const uint8_t CMD_A = 0b00000011;
 const uint8_t CMD_S = 0b00000010;
-const uint8_t CMD_D = 0b00000011;
+const uint8_t CMD_D = 0b00000100;
 const uint8_t CMD_STOP = 0b00000111;
 
+// ====== UI ======
 String htmlPage() {
   return R"HTML(
 <!doctype html><html><head><meta charset="utf-8"/>
 <title>WASD Control</title>
+<style>
+  body{font-family:system-ui,Arial;margin:2rem;}
+  button{font-size:1.1rem;padding:.6rem 1rem;margin:.3rem;}
+</style>
 <script>
-const CMD={W:1,A:4,S:2,D:5,STOP:7, M:255};
+const CMD={W:1,A:4,S:2,D:5,STOP:7,M:255};
 let pressed=new Set();
-async function send(b){
-  fetch('/api/cmd?b='+b).catch(()=>{});
-}
-function down(k){
-  if(!pressed.has(k)){ pressed.add(k); send(CMD[k]); }
-}
-function up(k){
-  if(pressed.has(k)){ pressed.delete(k); }
-  if(pressed.size==0) send(CMD.STOP);
-}
-window.addEventListener('keydown',e=>{
-  const k=e.key.toUpperCase(); if(CMD[k]){ e.preventDefault(); down(k); }
-});
-window.addEventListener('keyup',e=>{
-  const k=e.key.toUpperCase(); if(CMD[k]){ e.preventDefault(); up(k); }
-});
+async function send(b){ fetch('/api/cmd?b='+b).catch(()=>{}); }
+function down(k){ if(!pressed.has(k)){ pressed.add(k); send(CMD[k]); } }
+function up(k){ if(pressed.has(k)){ pressed.delete(k); } if(pressed.size==0) send(CMD.STOP); }
+window.addEventListener('keydown',e=>{ const k=e.key.toUpperCase(); if(CMD[k]){ e.preventDefault(); down(k); }});
+window.addEventListener('keyup',e=>{ const k=e.key.toUpperCase(); if(CMD[k]){ e.preventDefault(); up(k); }});
 </script></head><body>
 <h1>WASD Controller</h1>
-<p>Use keyboard W/A/S/D. Releases → Stop.</p>
+<p>Use keyboard W/A/S/D. Release all keys to STOP.</p>
+<div>
+  <button onclick="send(CMD.W)">W</button>
+  <button onclick="send(CMD.A)">A</button>
+  <button onclick="send(CMD.S)">S</button>
+  <button onclick="send(CMD.D)">D</button>
+  <button onclick="send(CMD.STOP)">STOP</button>
+  <button onclick="send(CMD.M)">Toggle Autonomy</button>
+</div>
 </body></html>
 )HTML";
 }
 
-  int computeTurnCycles(float err_cm) {
-    float mag = fabs(err_cm);
-    if (mag <= DEAD_BAND) return 0;
-    if (mag > MAX_ERR) mag = MAX_ERR;
+// ====== MOTOR DRIVER ======
+// drive(p1,p2,p3,p4, powerRight, powerLeft)
+// NOTE: enA_1 == RIGHT PWM, enA_2 == LEFT PWM (to match your earlier usage)
+void drive(int p1, int p2, int p3, int p4, int powerRight, int powerLeft) {
+  powerRight = constrain(powerRight, 0, 255);
+  powerLeft = constrain(powerLeft, 0, 255);
 
-    float t = (mag - DEAD_BAND) / (MAX_ERR - DEAD_BAND);  // 0..1
-    int cycles = (int)round(MIN_TURN_CYCLES + t * (MAX_TURN_CYCLES - MIN_TURN_CYCLES));
-    if (cycles < MIN_TURN_CYCLES) cycles = MIN_TURN_CYCLES;
-    if (cycles > MAX_TURN_CYCLES) cycles = MAX_TURN_CYCLES;
-    return cycles;
-  }
+  analogWrite(enA_1, powerRight);  // RIGHT
+  analogWrite(enA_2, powerLeft);   // LEFT
 
-void drive(int p1, int p2, int p3, int p4, int power1, int power2) {
-  analogWrite(enA_1, power1);
-  analogWrite(enA_2, power2);
-
-  digitalWrite(in1_1, p3);
+  digitalWrite(in1_1, p3);  // motor block 1 (RIGHT DIR)
   digitalWrite(in2_1, p4);
-
-  digitalWrite(in1_2, p1);
+  digitalWrite(in1_2, p1);  // motor block 2 (LEFT DIR)
   digitalWrite(in2_2, p2);
 }
 
+inline void forwardDifferential(int rightPWM, int leftPWM) {
+  drive(HIGH, LOW, HIGH, LOW, rightPWM, leftPWM);
+}
+
+inline void stopAll() {
+  drive(LOW, LOW, LOW, LOW, 0, 0);
+}
+
+// ====== SENSORS ======
+float readCm(uint8_t trig, uint8_t echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(3);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+  unsigned long d = pulseIn(echo, HIGH, ECHO_TIMEOUT_US);
+  if (d == 0) return FAR_CLAMP_CM;  // timeout → treat as far
+  float cm = (d * 0.0343f) / 2.0f;
+  if (cm > FAR_CLAMP_CM) cm = FAR_CLAMP_CM;
+  // after computing cm:
+  if (cm < NEAR_CLAMP_CM) cm = NEAR_CLAMP_CM;
+
+  return cm;
+}
+
+int mapErrToCycles(float absErr) {
+  float e = absErr;
+  if (e < DEAD_BAND) return 0;
+  if (e > MAX_ERR_CM) e = MAX_ERR_CM;
+  float t = (e - DEAD_BAND) / (MAX_ERR_CM - DEAD_BAND);  // 0..1
+  int cycles = (int)round(MIN_TURN_CYCLES + t * (MAX_TURN_CYCLES - MIN_TURN_CYCLES));
+  cycles = constrain(cycles, MIN_TURN_CYCLES, MAX_TURN_CYCLES);
+  return cycles;
+}
+
 void setup() {
+  Serial.begin(115200);
   Serial1.begin(SERIAL_BAUD);
+
+  // WiFi AP
   if (WiFi.beginAP(ssid) != WL_AP_LISTENING) {
     Serial.println("AP start failed");
-    while (true);
+    while (true)
+      ;
   }
+  server.begin();
 
   pinMode(trig1, OUTPUT);
   pinMode(echo1, INPUT);
   pinMode(trig2, OUTPUT);
   pinMode(echo2, INPUT);
 
-  server.begin();
   pinMode(enA_1, OUTPUT);
   pinMode(enA_2, OUTPUT);
   pinMode(in1_1, OUTPUT);
   pinMode(in2_1, OUTPUT);
   pinMode(in1_2, OUTPUT);
   pinMode(in2_2, OUTPUT);
-  pinMode(in1_2, OUTPUT);
   pinMode(encleft, INPUT_PULLUP);
   pinMode(encright, INPUT_PULLUP);
-  Serial.begin(115200);
+
+  stopAll();
+  cooldown_cycles_left = 0;
+  auto_state = AUTO_COOLDOWN;
+}
+
+// Returns true if a manual/HTTP command took control this loop
+bool handleSerialManual() {
+  if (!Serial.available()) return false;
+  char command = Serial.read();
+  switch (command) {
+    case 0b00000001: forwardDifferential(BASE_SPEED, BASE_SPEED); break;          // W
+    case 0b00000010: drive(LOW, HIGH, LOW, HIGH, BASE_SPEED, BASE_SPEED); break;  // S
+    case 0b00000011: forwardDifferential(BASE_SPEED, 0); break;                   // D (pivot-ish)
+    case 0b00000100: forwardDifferential(0, BASE_SPEED); break;                   // A (pivot-ish)
+    case 0b00000101: drive(LOW, HIGH, LOW, LOW, BASE_SPEED, 0); break;            // custom
+    case 0b00000110: drive(LOW, LOW, LOW, HIGH, 0, BASE_SPEED); break;            // custom
+    case 0b00000111: stopAll(); break;                                            // STOP
+    case 0b01111111: autonomous_mode = true; break;                               // enable autonomy
+    default: break;
+  }
+  return true;
+}
+
+bool handleHttpManual() {
+  WiFiClient client = server.available();
+  if (!client) return false;
+
+  // crude request parsing
+  String req = client.readStringUntil('\r');
+  client.readStringUntil('\n');  // discard
+
+  if (req.startsWith("GET /api/cmd")) {
+    int bIndex = req.indexOf("b=");
+    if (bIndex > 0) {
+      int val = req.substring(bIndex + 2).toInt();
+      switch (val) {
+        case 1: forwardDifferential(BASE_SPEED, BASE_SPEED); break;          // W
+        case 2: drive(LOW, HIGH, LOW, HIGH, BASE_SPEED, BASE_SPEED); break;  // S
+        case 4: forwardDifferential(0, BASE_SPEED); break;                   // A
+        case 5: forwardDifferential(BASE_SPEED, 0); break;                   // D
+        case 7: stopAll(); break;                                            // STOP
+        case 255:
+          autonomous_mode = !autonomous_mode;
+          stopAll();
+          break;  // toggle autonomy
+        default: stopAll(); break;
+      }
+    }
+    client.println("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK");
+  } else {
+    String page = htmlPage();
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: text/html");
+    client.println("Connection: close\r\n");
+    client.print(page);
+  }
+  client.stop();
+  return true;
 }
 
 void loop() {
-  digitalWrite(trig1, LOW);
-  delayMicroseconds(5);
-  digitalWrite(trig1, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trig1, LOW);
-  unsigned long duration1 = pulseIn(echo1, HIGH);
-  digitalWrite(trig2, LOW);
-  delayMicroseconds(5);
-  digitalWrite(trig2, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trig2, LOW);
-  unsigned long duration2 = pulseIn(echo2, HIGH);
+  // 1) Read sensors
+  float cmSide = readCm(trig1, echo1);   // side/right
+  float cmFront = readCm(trig2, echo2);  // front
 
-  float cm1 = (duration1 / 2) / 29.1;
-  float cm2 = (duration2 / 2) / 29.1;
+  // Optional extra clamp for ultrasonic near-field weirdness
+  if (cmSide < NEAR_CLAMP_CM) cmSide = NEAR_CLAMP_CM;
+  if (cmFront < NEAR_CLAMP_CM) cmFront = NEAR_CLAMP_CM;
 
+  // 2) Manual handlers (manual wins this cycle)
+  bool manual = handleSerialManual();
+  manual = handleHttpManual() || manual;
 
-  // Test: voltage control
-  // Tunables
-  const int baseSpeed = 255;  // try 200–230 if you’re saturating
-  const int maxCorr = 90;     // max differential added/subtracted
-  const int tooCloseMax = 15;
-  const int tooFarMin = 20;
-  const int farClamp = 110;  // clamp distant readings
+  // 3) Autonomous control
+  if (!manual && autonomous_mode) {
+    if (USE_FRONT_STOP && cmFront <= FRONT_STOP_CM) {
+      stopAll();
+    } else {
+      // Error: + => too far from RIGHT wall; - => too close
+      float err = cmSide - TARGET_CM;
+      float absErr = fabs(err);
+      int signE = sgn(err);  // -1,0,+1
 
-  int leftSpeed, rightSpeed;
-  int cm = cm1;  // raw sensor reading
+      // Differential steering (right-wall mapping):
+      float diffF = KP * err;
+      if (diffF > MAX_DIFF) diffF = MAX_DIFF;
+      if (diffF < -MAX_DIFF) diffF = -MAX_DIFF;
+      int diff = (int)round(diffF);
 
-  boolean noRes = false;
+      int rightSpeed, leftSpeed;
+      if (HUG_RIGHT) {
+        // Too far (+diff): slow RIGHT, speed LEFT -> turn RIGHT towards wall
+        rightSpeed = BASE_SPEED - diff;
+        leftSpeed = BASE_SPEED + diff;
+      } else {
+        rightSpeed = BASE_SPEED + diff;
+        leftSpeed = BASE_SPEED - diff;
+      }
+      rightSpeed = constrain(rightSpeed, 0, 255);
+      leftSpeed = constrain(leftSpeed, 0, 255);
 
-  // Optional: clamp crazy far readings
-  if (cm > farClamp) cm = farClamp;
-
-  if (cm < tooCloseMax) {
-    // Too close: turn LEFT (slow left, speed up right)
-    // diff goes from maxCorr at 0 cm down to 0 at 25 cm  → continuous at 25
-    int diff = map(cm, 0, tooCloseMax, maxCorr, 0);
-    leftSpeed = baseSpeed - diff;
-    rightSpeed = baseSpeed + diff;
-  } else if (cm > tooFarMin) {
-    // Too far: turn RIGHT (speed up left, slow right)
-    // diff goes from 0 at 40 cm up to maxCorr at 110 cm → continuous at 40
-    int diff = map(cm, tooFarMin, farClamp, 0, maxCorr);
-    leftSpeed = baseSpeed + diff;
-    rightSpeed = baseSpeed - diff;
-  } else {
-    // In-range: go straight
-    noRes = true;
-    leftSpeed = baseSpeed;
-    rightSpeed = baseSpeed;
-  }
-
-  // Always keep within [0,255]
-  if (!noRes) {
-    leftSpeed = constrain(leftSpeed, 0, 215);
-    rightSpeed = constrain(rightSpeed, 0, 255);
-  }
-
-
-  if (autonomous_mode) {
-    float error = abs(cm1 - TARGET_CM);  // >0: too far from wall (turn LEFT to hug), <0: too close (turn RIGHT)
-    int desired_turn_cycles = computeTurnCycles(error);
-
-    switch (auto_state) {
-      case FORWARDING:
-        
-          if (forward_cooldown_left > 0) {
-            // Must go forward during cooldown
-            drive(speed, lowVol, speed, lowVol, 255, 255);
-            forward_cooldown_left--;
-          } else {
-            // Cooldown complete: only turn if outside dead band
-            if (desired_turn_cycles > 0) {
-              if (error > 0) {
-                auto_state = TURNING;
+      // --- Preemptable burst + breakable cooldown ---
+      switch (auto_state) {
+        case AUTO_COOLDOWN:
+          {
+            // If error gets large again, break cooldown and start a new burst
+            if (absErr > (DEAD_BAND + BREAK_COOLDOWN_ERR)) {
+              int want = mapErrToCycles(absErr);
+              if (want > 0 && signE != 0) {
+                burst_dir = signE;  // remember direction at burst start
+                turn_cycles_left = want;
+                auto_state = AUTO_STEER_BURST;
+                forwardDifferential(rightSpeed, leftSpeed);
+                turn_cycles_left--;
+              } else {
+                forwardDifferential(BASE_SPEED, BASE_SPEED);
               }
-              turn_cycles_left = desired_turn_cycles;
             } else {
-              // Already near target — keep moving forward
-              drive(speed, lowVol, speed, lowVol, 255, 255);
+              // Otherwise keep going straight during cooldown
+              forwardDifferential(BASE_SPEED, BASE_SPEED);
+              if (cooldown_cycles_left > 0) cooldown_cycles_left--;
+              else cooldown_cycles_left = 0;
             }
           }
-        
-        break;
+          break;
 
-      case TURNING:
-        
-          if (turn_cycles_left > 0) {
-            drive(speed, lowVol, speed, lowVol, rightSpeed, leftSpeed);
-            turn_cycles_left--;
-          } else {
-            auto_state = FORWARDING;
-            forward_cooldown_left = FORWARD_COOLDOWN;
+        case AUTO_STEER_BURST:
+          {
+            // End the burst immediately if we overshoot or get back in-range
+            if (signE == 0 || (signE != burst_dir) || absErr <= DEAD_BAND) {
+              auto_state = AUTO_COOLDOWN;
+              cooldown_cycles_left = FORWARD_COOLDOWN;
+              burst_dir = 0;
+              forwardDifferential(BASE_SPEED, BASE_SPEED);
+            } else if (turn_cycles_left > 0) {
+              forwardDifferential(rightSpeed, leftSpeed);
+              turn_cycles_left--;
+            } else {
+              // normal end of burst -> cooldown
+              auto_state = AUTO_COOLDOWN;
+              cooldown_cycles_left = FORWARD_COOLDOWN;
+              burst_dir = 0;
+              forwardDifferential(BASE_SPEED, BASE_SPEED);
+            }
           }
-        
-        break;
-    }
-  }
-
-  // Old code, with cooldown control
-  // if (cm1 <= 25) {
-  //   if (turning_counter <= COOLDOWN_TURNING_THRESHOLD && forward_counter >= COOLDOWN_FORWARD_THRESHOLD) {
-  //     drive(speed, lowVol, speed, lowVol);
-  //     turning_counter ++;
-  //     forward_counter = min(forward_counter - 1, 0);
-  //   } else {
-  //     drive(lowVol, lowVol, speed, lowVol);
-  //     turning_counter = min(turning_counter - 1, 0);
-  //     forward_counter = max(forward_counter + 1, COOLDOWN_FORWARD_THRESHOLD);
-  //   }
-  // } else if (cm1 > 40) {
-  //   if (turning_counter <= COOLDOWN_TURNING_THRESHOLD && forward_counter >= COOLDOWN_FORWARD_THRESHOLD) {
-  //     drive(speed, lowVol, lowVol, lowVol);
-  //     turning_counter ++;
-  //     forward_counter = min(forward_counter - 1, 0);
-  //   } else {
-  //     drive(speed, lowVol, lowVol, lowVol);
-  //     turning_counter = min(turning_counter - 1, 0);
-  //     forward_counter = max(forward_counter + 1, COOLDOWN_FORWARD_THRESHOLD);
-  //   }
-  // } else {
-  //   drive(speed, lowVol, speed, lowVol);
-  //   forward_counter = max(forward_counter + 1, COOLDOWN_FORWARD_THRESHOLD);
-  // }
-
-Serial.print("Side: ");
-Serial.print(cm1);
-Serial.println();
-Serial.print("Voltage Left: ");
-Serial.print(leftSpeed);
-Serial.print("    Voltage Right: ");
-Serial.print(rightSpeed);
-Serial.println();
-delay(80);
-
-int leftEncoderVal = digitalRead(encleft);
-int rightEncoderVal = digitalRead(encright);
-// Serial.print('E');
-// Serial.print(leftEncoderVal);
-// Serial.print('#');
-// Serial.print(rightEncoderVal);
-// Serial.println();
-if (Serial.available()) {
-  char command = Serial.read();
-  if (command == 0b00000001) {
-    // FORWARD FORWARD
-    drive(HIGH, lowVol, HIGH, lowVol, speed, speed);
-  } else if (command == 0b00000010) {
-    // BACKWARD BACKWARD
-    drive(lowVol, HIGH, lowVol, HIGH, speed, speed);
-  } else if (command == 0b00000011) {
-    // FORWARD STATIC
-    drive(HIGH, lowVol, lowVol, lowVol, speed, speed);
-  } else if (command == 0b00000100) {
-    // STATIC FORWARD
-    drive(lowVol, lowVol, HIGH, lowVol, speed, speed);
-  } else if (command == 0b00000101) {
-    // BACKWARD STATIC
-    drive(lowVol, HIGH, lowVol, lowVol, speed, speed);
-  } else if (command == 0b00000110) {
-    // STATIC BACKWARD
-    drive(lowVol, lowVol, lowVol, HIGH, speed, speed);
-  } else if (command == 0b00000111) {
-    // STATIC STATIC
-    drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
-    digitalWrite(enA_1, lowVol);
-    digitalWrite(enA_2, lowVol);
-  } else if (command == 0b01000000) {
-    // FORWARD BACKWARD
-    drive(lowVol, speed, speed, lowVol, speed, speed);
-  } else if (command == 0b01100000) {
-    // BACKWARD FORWARD
-    drive(speed, lowVol, lowVol, speed, speed, speed);
-  } else if (command == 0b01110000) {
-    //speed control init
-    while (!Serial.available()) {}  // Wait for speed control signal
-    char speedVal = Serial.read();
-    speed = speedVal;
-    Serial.print(speed);
-  } else if (command == 0b01111111) {
-    autonomous_mode = 1;
-  }
-}
-
-WiFiClient client = server.available();
-if (!client) return;
-
-// Wait for request
-String req = client.readStringUntil('\r');
-client.readStringUntil('\n');  // discard
-
-// Very basic parsing
-if (req.startsWith("GET /api/cmd")) {
-  int bIndex = req.indexOf("b=");
-  if (bIndex > 0) {
-    int val = req.substring(bIndex + 2).toInt();
-    if (val >= 0 && val <= 255) {
-      switch (val) {
-        case 1:
-          drive(HIGH, lowVol, HIGH, lowVol, speed, speed);
           break;
-        case 4:
-          drive(lowVol, lowVol, HIGH, lowVol, speed, speed);
-          break;
-        case 2:
-          drive(lowVol, HIGH, lowVol, HIGH, speed, speed);
-          break;
-        case 5:
-          drive(HIGH, lowVol, lowVol, lowVol, speed, speed);
-          break;
-        case 255:
-          autonomous_mode = !autonomous_mode;
-          break;
-        default:
-          drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
       }
+
+      // (Optional) telemetry remembers what we *intend* to use
+      lastLeft = leftSpeed;
+      lastRight = rightSpeed;
     }
   }
-  client.println("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK");
-} else {  // root page
-  String page = htmlPage();
-  client.println("HTTP/1.1 200 OK");
-  client.println("Content-Type: text/html");
-  client.println("Connection: close\r\n");
-  client.print(page);
-}
-client.stop();
-// delay(20); // remove because of echo delay
+
+  // 4) Telemetry (unchanged)
+  int leftEncoderVal = digitalRead(encleft);
+  int rightEncoderVal = digitalRead(encright);
+  Serial.print("Side(cm): ");
+  Serial.print(cmSide);
+  Serial.print("  Front(cm): ");
+  Serial.print(cmFront);
+  Serial.print("  L:");
+  Serial.print(lastLeft);
+  Serial.print("  R:");
+  Serial.print(lastRight);
+  Serial.print("  State:");
+  Serial.print(auto_state == AUTO_STEER_BURST ? "STEER" : "COOL");
+  Serial.print("  tc:");
+  Serial.print(turn_cycles_left);
+  Serial.print("  cd:");
+  Serial.print(cooldown_cycles_left);
+  Serial.print("  burst:");
+  Serial.print(burst_dir);
+  Serial.print("  EncL:");
+  Serial.print(leftEncoderVal);
+  Serial.print("  EncR:");
+  Serial.println(rightEncoderVal);
+
+  delay(80);
 }
