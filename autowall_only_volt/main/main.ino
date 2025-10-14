@@ -11,6 +11,9 @@
 #define trig2 6   // front sensor
 #define echo1 5
 #define echo2 9
+#include <avr/interrupt.h>
+
+volatile bool tick100ms = false;
 
 #include <WiFiS3.h>
 #include <math.h>
@@ -25,61 +28,10 @@ IPAddress AP_SN(255, 255, 255, 0);
 // === Serial ===
 const int SERIAL_BAUD = 115200;
 
-// === Behavior Tuning ===
-// Target distance to right wall (cm)
-const float TARGET_CM       = 18.0f;
-const float DEAD_BAND       = 3.0f;   // ignore tiny errors
-const float MAX_ERR_CM      = 12.0f;  // scaling cap
-
-// Base forward speed and general limits
-const int   BASE_SPEED      = 220;    // 0..255
-
-// PD steering + filtering (to avoid wall slam)
-const float SIDE_FILTER_ALPHA = 0.35f; // 0..1; higher=snappier, lower=smoother
-const float KP = 2.6f;                 // proportional gain (cm -> PWM)
-const float KD = 1.1f;                 // derivative per loop (Δcm -> PWM)
-
-// Dynamic steering limits (small near target, larger when far)
-const int   MAX_DIFF_NEAR = 35;        // PWM delta cap when near target
-const int   MAX_DIFF_FAR  = 100;       // PWM delta cap when far
-const float NEAR_ZONE_CM  = 8.0f;      // |err| <= this → "near"
-
-// Slew limit on steering updates (per loop ~80ms)
-const int   DIFF_SLEW     = 12;        // PWM per loop
-
-// Burst + Cooldown (to avoid dithering)
-const int   MIN_TURN_CYCLES = 2;
-const int   MAX_TURN_CYCLES = 6;
-const int   FORWARD_COOLDOWN= 6;
-
-// Cooldown early-break threshold (so we correct promptly)
-const float BREAK_COOLDOWN_ERR = 2.5f; // extra cm beyond dead band
-
-// Safety / sensor
-const bool  USE_FRONT_STOP   = false;  // keep false per your request
-const float FRONT_STOP_CM    = 15.0f;  // used only if USE_FRONT_STOP = true
-const float FAR_CLAMP_CM     = 200.0f; // clamp noisy long reads
-const float NEAR_CLAMP_CM    = 3.0f;   // clamp silly-near reads
-const unsigned long ECHO_TIMEOUT_US = 25000UL; // ~4m timeout
-
-// Right-hand wall hugging
-const bool  HUG_RIGHT = true;
-
-// === State ===
-enum AutoState { AUTO_STEER_BURST, AUTO_COOLDOWN };
-AutoState auto_state = AUTO_COOLDOWN;
-int  turn_cycles_left       = 0;
-int  cooldown_cycles_left   = 0;
-int  burst_dir              = 0; // +1/-1/0 (direction at burst start)
 bool autonomous_mode        = false;
 
 // Telemetry cache
 int   lastLeft = 0, lastRight = 0;
-
-// Filter / PD memory
-float cmSideFilt  = TARGET_CM;
-float prevErr     = 0.0f;
-int   prevDiffCmd = 0;
 
 // === Commands ===
 const uint8_t CMD_W    = 0b00000001;
@@ -112,33 +64,13 @@ window.addEventListener('keyup',e=>{ const k=e.key.toUpperCase(); if(CMD[k]){ e.
 )HTML";
 }
 
-// === Helpers ===
-inline int sgn(float x){ return (x>0) - (x<0); }
-
-inline float mapf(float x, float in_min, float in_max, float out_min, float out_max){
-  if (x <= in_min) return out_min;
-  if (x >= in_max) return out_max;
-  return out_min + (out_max - out_min) * (x - in_min) / (in_max - in_min);
-}
-
 float readCm(uint8_t trig, uint8_t echo) {
   digitalWrite(trig, LOW); delayMicroseconds(3);
   digitalWrite(trig, HIGH); delayMicroseconds(10);
   digitalWrite(trig, LOW);
   unsigned long d = pulseIn(echo, HIGH, ECHO_TIMEOUT_US);
-  if (d == 0) return FAR_CLAMP_CM; // timeout → treat as far
   float cm = (d * 0.0343f) / 2.0f;
-  if (cm > FAR_CLAMP_CM) cm = FAR_CLAMP_CM;
-  if (cm < NEAR_CLAMP_CM) cm = NEAR_CLAMP_CM;
   return cm;
-}
-
-int mapErrToCycles(float absErr){
-  if (absErr < DEAD_BAND) return 0;
-  if (absErr > MAX_ERR_CM) absErr = MAX_ERR_CM;
-  float t = (absErr - DEAD_BAND) / (MAX_ERR_CM - DEAD_BAND); // 0..1
-  int cycles = (int)round(MIN_TURN_CYCLES + t*(MAX_TURN_CYCLES - MIN_TURN_CYCLES));
-  return constrain(cycles, MIN_TURN_CYCLES, MAX_TURN_CYCLES);
 }
 
 // drive(p1,p2,p3,p4, powerRight, powerLeft)
@@ -154,10 +86,9 @@ void drive(int p1, int p2, int p3, int p4, int powerRight, int powerLeft) {
   digitalWrite(in2_2, p2);
 }
 
-inline void forwardDifferential(int rightPWM, int leftPWM){
-  drive(HIGH, LOW, HIGH, LOW, rightPWM, leftPWM);
-}
 inline void stopAll(){ drive(LOW, LOW, LOW, LOW, 0, 0); }
+inline void slideLeft(){ drive(LOW, HIGH, LOW, HIGH, 255, 200); }
+inline void slideLeft(){ drive(LOW, HIGH, LOW, HIGH, 200, 255); }
 
 // === Manual control handlers ===
 bool handleSerialManual() {
@@ -231,12 +162,6 @@ void setup() {
   pinMode(encright, INPUT_PULLUP);
 
   stopAll();
-  auto_state = AUTO_COOLDOWN;
-  cooldown_cycles_left = 0;
-  burst_dir = 0;
-  cmSideFilt = TARGET_CM;
-  prevErr = 0.0f;
-  prevDiffCmd = 0;
 }
 
 // === Main Loop ===
@@ -245,107 +170,20 @@ void loop() {
   float cmSide  = readCm(trig1, echo1);   // right wall
   float cmFront = readCm(trig2, echo2);   // ahead
 
-  // IIR filter on side distance
-  cmSideFilt += SIDE_FILTER_ALPHA * (cmSide - cmSideFilt);
-
   // 2) Manual handlers (manual wins this cycle)
   bool manual = handleSerialManual();
   manual = handleHttpManual() || manual;
 
   // 3) Autonomous control
-  if (!manual && autonomous_mode) {
-    if (USE_FRONT_STOP && cmFront <= FRONT_STOP_CM) {
-      stopAll();
+  if (autonomous_mode) {
+    if (cm1 > 8) {
+      turnLeft();
+    } else if (cm1 <= 10){
+      turnRight();
     } else {
-      // Error: + => too far from RIGHT wall; - => too close
-      float err    = cmSideFilt - TARGET_CM;
-      float absErr = fabs(err);
-      int   signE  = sgn(err);
-
-      // --- PD steering ---
-      float derr  = err - prevErr;                 // per loop (~80ms)
-      float diffF = KP * err + KD * derr;          // PWM delta
-      // Dynamic cap based on |err|
-      int dynMax  = (int)round(mapf(absErr, 0.0f, MAX_ERR_CM, (float)MAX_DIFF_NEAR, (float)MAX_DIFF_FAR));
-
-      int diffCmd = (int)round(diffF);
-      if (diffCmd >  dynMax) diffCmd =  dynMax;
-      if (diffCmd < -dynMax) diffCmd = -dynMax;
-
-      // Slew limit steering command
-      if (diffCmd > prevDiffCmd + DIFF_SLEW) diffCmd = prevDiffCmd + DIFF_SLEW;
-      else if (diffCmd < prevDiffCmd - DIFF_SLEW) diffCmd = prevDiffCmd - DIFF_SLEW;
-
-      // Convert to wheel PWMs (10=RIGHT, 11=LEFT), right-wall mapping:
-      // +err (too far) → turn RIGHT: slow RIGHT, speed LEFT
-      int rightSpeed = BASE_SPEED - diffCmd;
-      int leftSpeed  = BASE_SPEED + diffCmd;
-      rightSpeed = constrain(rightSpeed, 0, 255);
-      leftSpeed  = constrain(leftSpeed , 0, 255);
-
-      // --- Preemptable burst + breakable cooldown ---
-      switch (auto_state) {
-        case AUTO_COOLDOWN: {
-          // Break cooldown early if error grows beyond margin
-          if (absErr > (DEAD_BAND + BREAK_COOLDOWN_ERR)) {
-            int want = mapErrToCycles(absErr);
-            if (want > 0 && signE != 0) {
-              burst_dir = signE;
-              turn_cycles_left = want;
-              auto_state = AUTO_STEER_BURST;
-              forwardDifferential(rightSpeed, leftSpeed);
-              turn_cycles_left--;
-            } else {
-              forwardDifferential(BASE_SPEED, BASE_SPEED);
-            }
-          } else {
-            forwardDifferential(BASE_SPEED, BASE_SPEED);
-            if (cooldown_cycles_left > 0) cooldown_cycles_left--;
-            else cooldown_cycles_left = 0;
-          }
-        } break;
-
-        case AUTO_STEER_BURST: {
-          // End burst if overshoot (sign flip), in-range, or cycles done
-          if (signE == 0 || (signE != burst_dir) || absErr <= DEAD_BAND) {
-            auto_state = AUTO_COOLDOWN;
-            cooldown_cycles_left = FORWARD_COOLDOWN;
-            burst_dir = 0;
-            forwardDifferential(BASE_SPEED, BASE_SPEED);
-          } else if (turn_cycles_left > 0) {
-            forwardDifferential(rightSpeed, leftSpeed);
-            turn_cycles_left--;
-          } else {
-            auto_state = AUTO_COOLDOWN;
-            cooldown_cycles_left = FORWARD_COOLDOWN;
-            burst_dir = 0;
-            forwardDifferential(BASE_SPEED, BASE_SPEED);
-          }
-        } break;
-      }
-
-      // Telemetry cache & PD memory
-      lastLeft     = leftSpeed;
-      lastRight    = rightSpeed;
-      prevErr      = err;
-      prevDiffCmd  = diffCmd;
+      goForward();
     }
   }
-
-  // 4) Telemetry
-  int leftEncoderVal  = digitalRead(encleft);
-  int rightEncoderVal = digitalRead(encright);
-
-  Serial.print("Side(cm): ");   Serial.print(cmSide);
-  Serial.print("  Front(cm): ");Serial.print(cmFront);
-  Serial.print("  L:");         Serial.print(lastLeft);
-  Serial.print("  R:");         Serial.print(lastRight);
-  Serial.print("  State:");     Serial.print(auto_state==AUTO_STEER_BURST?"STEER":"COOL");
-  Serial.print("  tc:");        Serial.print(turn_cycles_left);
-  Serial.print("  cd:");        Serial.print(cooldown_cycles_left);
-  Serial.print("  burst:");     Serial.print(burst_dir);
-  Serial.print("  EncL:");      Serial.print(leftEncoderVal);
-  Serial.print("  EncR:");      Serial.println(rightEncoderVal);
 
   delay(80); // loop cadence ~12.5 Hz (tune DIFF_SLEW with this)
 }

@@ -1,8 +1,8 @@
-#define enA_1 10  
+#define enA_1 10
 #define enA_2 11
-#define in1_1 4
-#define in2_1 2 
-#define in1_2 7 
+#define in1_1 2
+#define in2_1 4
+#define in1_2 7
 #define in2_2 8
 #define encleft 12
 #define encright 13
@@ -15,37 +15,47 @@
 IPAddress AP_IP(192, 168, 4, 1);
 IPAddress AP_GW(192, 168, 4, 1);
 IPAddress AP_SN(255, 255, 255, 0);
-// --- Autonomous state machine settings ---
-const int   MIN_TURN_CYCLES   = 1;    // shortest turn when error is small
-const int   MAX_TURN_CYCLES   = 2;    // longest turn when error is large
 
-const int FORWARD_COOLDOWN    = 3;    // Y: forward cycles required before next turn
+void goForward() {
+  drive(0, HIGH, 0, HIGH, 122, 122);
+}
 
-enum AutoState { FORWARDING, TURNING_LEFT, TURNING_RIGHT };
-AutoState auto_state = FORWARDING;
+void strongLeftTurn() {
+  drive(HIGH, 0, 0, HIGH, 100, -100);
+}
 
-int turn_cycles_left = 0;
-int forward_cooldown_left = 3;
+void strongRightTurn() {
+  drive(0, HIGH, HIGH, 0, 100, 100);
+}
 
-// Drive helpers (fix signatures)
-inline void goForward(){ drive(HIGH, 0, HIGH, 0, 255, 255); }
-inline void turnLeft (){ drive(HIGH, 0, HIGH, 0, 255,  200); }  // left wheel stops, right forward
-inline void turnRight(){ drive(HIGH, 0, HIGH, 0, 200,  255); }  // left forward, right stops
-inline void stopDrive(){ drive(0,0,0,0,0,0); }
+void turnLeft(int speed) {
+  drive(0, HIGH, 0, HIGH, 70, speed);
+}
+void turnRight(int speed) {
+  drive(0, HIGH, 0, HIGH, speed, 70);
+}
+void stopDrive() {
+  drive(0, 0, 0, 0, 0, 0);
+}
+
+float sideData[5];
+int sideCounter = 0;
+float frontData[5];
+int frontCounter = 0;
 
 boolean autonomous_mode = 0;
 
-const char* ssid = "ARDUINO_FINAL_BOSS";   // open AP (no password)
+const char* ssid = "ARDUINO_FINAL_BOSS";  // open AP (no password)
 WiFiServer server(80);
 
 const int SERIAL_BAUD = 115200;
 
 // Command bytes
-const uint8_t CMD_W     = 0b00000001;
-const uint8_t CMD_A     = 0b00000100;
-const uint8_t CMD_S     = 0b00000010;
-const uint8_t CMD_D     = 0b00000011;
-const uint8_t CMD_STOP  = 0b00000111;
+const uint8_t CMD_W = 0b00000001;
+const uint8_t CMD_A = 0b00000100;
+const uint8_t CMD_S = 0b00000010;
+const uint8_t CMD_D = 0b00000011;
+const uint8_t CMD_STOP = 0b00000111;
 
 String htmlPage() {
   return R"HTML(
@@ -79,11 +89,14 @@ window.addEventListener('keyup',e=>{
 
 int speed = 255;
 int lowVol = 0;
-int desired_turn_cycles = 2;
 
 void setup() {
-  Serial1.begin(SERIAL_BAUD); // UART to robot
-  if (WiFi.beginAP(ssid) != WL_AP_LISTENING) { Serial.println("AP start failed"); while (true); }
+  Serial1.begin(SERIAL_BAUD);  // UART to robot
+  if (WiFi.beginAP(ssid) != WL_AP_LISTENING) {
+    Serial.println("AP start failed");
+    while (true)
+      ;
+  }
 
   pinMode(trig1, OUTPUT);
   pinMode(echo1, INPUT);
@@ -103,6 +116,15 @@ void setup() {
   Serial.begin(115200);
 }
 
+float arrAvg(const float* arr, size_t n) {
+  if (!arr || n == 0) return NAN;  // avoid div-by-zero / bad input
+  double sum = 0.0;                // better precision while summing
+  for (size_t i = 0; i < n; ++i) {
+    sum += arr[i];
+  }
+  return (float)(sum / (double)n);
+}
+
 void loop() {
   digitalWrite(trig1, LOW);
   delayMicroseconds(5);
@@ -117,35 +139,80 @@ void loop() {
   digitalWrite(trig2, LOW);
   unsigned long duration2 = pulseIn(echo2, HIGH);
 
-  float cm1 = (duration1/2) / 29.1;
-  float cm2 = (duration2/2) / 29.1;
+  float cm1 = (duration1 / 2) / 29.1;
+  float cm2 = (duration2 / 2) / 29.1;
+  if (sideCounter == 5 && frontCounter == 5) {
+    sideCounter = 0;
+    frontCounter = 0;
 
-  if (autonomous_mode) {
-    if (cm2 < 20) {
-      turnLeft();
-    } else {
-      if (cm1 < 20) {
-        turnLeft();
-      } else if (cm1 > 40) {
-        turnRight();
-      } else {
+    float sideAvg = arrAvg(sideData, 5);
+    float frontAvg = arrAvg(frontData, 5);
+
+  
+  Serial.print(sideAvg);
+    Serial.print(" ");
+    Serial.print(frontAvg);
+    Serial.println();
+
+    if (autonomous_mode) {
+      // if (frontAvg > 600 && sideAvg > 70) {
+      //   turnLeft(100);
+      //   delay(20);
+      //   goForward();
+      //   delay(500);
+      // } else 
+      if (frontAvg < 25) {
+        Serial.println("strong left");
+        strongLeftTurn();
+        delay(100);
         goForward();
+        delay(500);
+      } else {
+        if (sideAvg < 20) {
+          Serial.println("left");
+          turnLeft(50);
+          delay(10);
+          goForward();
+          delay(400);
+        } else if (sideAvg > 30) {
+          Serial.println("right");
+          turnRight(50);
+          delay(10);
+          goForward();
+          delay(400);
+        } else {
+          goForward();
+        }
       }
     }
   }
+  sideData[sideCounter] = cm1;
+  sideCounter++;
+  frontData[frontCounter] = cm2;
+  frontCounter++;
 
 
-
-  Serial.print("Side: ");  
-  Serial.print(cm1);
-  Serial.print(" Front: ");  
-  Serial.print(cm2);
-  Serial.println();  
-  delay(100);
+  // int error = cm1 - 25;
+  // if (error > 2) {
+  //   if (autonomous_mode) {
+  //     turnLeft(200);
+  //   }
+  //   Serial.print(" going left ");
+  // } else if (error < -2) {
+  //   if (autonomous_mode) {
+  //     turnRight(200);
+  //   }
+  //   Serial.print(" going right ");
+  // } else {
+  //   if (autonomous_mode) {
+  //     goForward();
+  //   }
+  //   Serial.print(" going forward ");
+  // }
   int leftEncoderVal = digitalRead(encleft);
   int rightEncoderVal = digitalRead(encright);
   // Serial.print('E');
-  // Serial.print(leftEncoderVal); 
+  // Serial.print(leftEncoderVal);
   // Serial.print('#');
   // Serial.print(rightEncoderVal);
   // Serial.println();
@@ -182,7 +249,7 @@ void loop() {
       drive(speed, lowVol, lowVol, speed, speed, speed);
     } else if (command == 0b01110000) {
       //speed control init
-      while (!Serial.available()) {} // Wait for speed control signal
+      while (!Serial.available()) {}  // Wait for speed control signal
       char speedVal = Serial.read();
       speed = speedVal;
       Serial.print(speed);
@@ -190,43 +257,43 @@ void loop() {
       autonomous_mode = 1;
     }
   }
-  
+
   WiFiClient client = server.available();
   if (!client) return;
 
   // Wait for request
   String req = client.readStringUntil('\r');
-  client.readStringUntil('\n'); // discard
+  client.readStringUntil('\n');  // discard
 
-  // Very basic parsing
   if (req.startsWith("GET /api/cmd")) {
     int bIndex = req.indexOf("b=");
     if (bIndex > 0) {
       int val = req.substring(bIndex + 2).toInt();
       if (val >= 0 && val <= 255) {
         switch (val) {
-	case 1:
-          drive(HIGH, lowVol, HIGH, lowVol, speed, speed);
-          break;
-	case 4:
-          drive(lowVol, lowVol, HIGH, lowVol, speed, speed);
-          break;
-	case 2:
-          drive(lowVol, HIGH, lowVol, HIGH, speed, speed);
-          break;
-	case 5:
-          drive(HIGH, lowVol, lowVol, lowVol, speed, speed);
-          break;
-	case 255:
-          autonomous_mode = !autonomous_mode;
-          break;
-	default:
-          drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
-        } 
+          case 1:
+            drive(HIGH, lowVol, HIGH, lowVol, speed, speed);
+            break;
+          case 4:
+            drive(lowVol, lowVol, HIGH, lowVol, speed, speed);
+            break;
+          case 2:
+            drive(lowVol, HIGH, lowVol, HIGH, speed, speed);
+            break;
+          case 5:
+            drive(HIGH, lowVol, lowVol, lowVol, speed, speed);
+            break;
+          case 255:
+            autonomous_mode = !autonomous_mode;
+            drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
+            break;
+          default:
+            drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
+        }
       }
     }
     client.println("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK");
-  } else { // root page
+  } else {  // root page
     String page = htmlPage();
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/html");
@@ -234,7 +301,6 @@ void loop() {
     client.print(page);
   }
   client.stop();
-  // delay(20); // remove because of echo delay
 }
 
 void drive(int p1, int p2, int p3, int p4, int power1, int power2) {
