@@ -4,7 +4,7 @@
 #define in2_1 4
 #define in1_2 7
 #define in2_2 8
-#define servopin 13
+#define servopin 12
 #define trig1 3
 #define trig2 6
 #define echo1 5
@@ -18,7 +18,7 @@ IPAddress AP_SN(255, 255, 255, 0);
 
 
 Servo servo1;
-const int num_positions = 8;
+const int num_positions = 9;
 int servo_dir = 0;
 int servo_step;
 
@@ -27,20 +27,114 @@ float beliefs[num_positions];
 float dis[num_positions];
 float prob[num_positions];
 
-// --- 8 direction helpers ---
-// Tip: tune the delays (ms) to taste or replace with your own milder/stronger turn functions.
+void testDirection () {
+    // 1) Sweep: sample distances at evenly spaced angles
+    for (int i = 0; i < num_positions; i++) {
+      int angle = i * servo_step;      // map index to angle
+      Serial.println(angle);
+      servo1.write(angle);
+      delay(100);
+      dis[i] = read_ultrasonic(trig2, echo2); // cm
+    }
 
-void dir_right_hard()   { strongRightTurn(); }                 // pivot/faster right
-void dir_right()        { strongRightTurn(); delay(80); goForward(); }
-void dir_right_slight() { strongRightTurn(); delay(40); goForward(); }
+  Serial.print("Raw Distance: ");
+  printFloat9(dis);
+    // 2) Normalize distances to 0..1 by dividing by max
+    float maxVal = arr_max(dis, num_positions);
+    if (maxVal <= 0.0001) maxVal = 1.0;
+    arr_div(dis, num_positions, maxVal);
 
-void dir_forward_right(){ goForward(); /* optionally bias right motor a bit slower */ }
-void dir_forward_left() { goForward(); /* optionally bias left motor a bit slower  */ }
+  Serial.print("Normalized Distance: ");
+  printFloat9(dis);
 
-void dir_left_slight()  { strongLeftTurn();  delay(40); goForward(); }
-void dir_left()         { strongLeftTurn();  delay(80); goForward(); }
-void dir_left_hard()    { strongLeftTurn(); }                  // pivot/faster left
+    // 3) Convert to likelihood: closer -> higher (1 - normalized distance)
+    arr_mirror1(dis, prob, num_positions);
 
+  Serial.print("Probability: ");
+  printFloat9(prob);
+  
+    // 4) Multiply prior (beliefs) by likelihoods (Bayes update)
+    arr_mul(beliefs, prob, num_positions);
+
+  Serial.print("Updated Belief: ");
+  printFloat9(beliefs);
+
+    int best_idx = arr_maxi(beliefs, num_positions);
+
+  Serial.print("Decision");
+  Serial.print(best_idx);
+  arr_probn(beliefs, num_positions);
+}
+
+void direction176 () {
+  drive(0, HIGH, HIGH, 0, 160, 160);
+  delay(300);
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
+
+void direction156 () {
+  drive(0, HIGH, HIGH, 0, 160, 160);
+  delay(230);
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
+
+void direction132 () {
+  drive(0, HIGH, HIGH, 0, 160, 160);
+  delay(160);
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
+
+void direction110 () {
+  drive(0, HIGH, HIGH, 0, 160, 160);
+  delay(100);
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
+
+void direction88 () {
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
+
+void direction66 () {
+  drive(HIGH, 0, 0, HIGH, 160, 160);
+  delay(170);
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
+
+void direction44 () {
+  drive(HIGH, 0, 0, HIGH, 160, 160);
+  delay(220);
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
+
+void direction22 () {
+  drive(HIGH, 0, 0, HIGH, 160, 160);
+  delay(280);
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
+
+void direction0() {
+  drive(HIGH, 0, 0, HIGH, 160, 160);
+  delay(400);
+  drive(0, HIGH, 0, HIGH, 133, 133);
+  delay(200);
+  stopDrive();
+}
 
 void goForward() {
   drive(0, HIGH, 0, HIGH, 133, 133);
@@ -84,7 +178,7 @@ String htmlPage() {
   <!doctype html><html><head><meta charset="utf-8"/>
   <title>WASD Control</title>
   <script>
-  const CMD={W:1,A:4,S:2,D:5,STOP:7, M:255, N:254};
+  const CMD={W:1,A:4,S:2,D:5,STOP:7, M:255, N:254, F: 65, G: 66, Z: 100};
   let pressed=new Set();
   async function send(b){
     fetch('/api/cmd?b='+b).catch(()=>{});
@@ -111,6 +205,15 @@ String htmlPage() {
 
 int speed = 255;
 int lowVol = 0;
+
+void printFloat9(const float a[9]) {
+  for (int i = 0; i < 9; ++i) {
+    if (i) Serial.print(", ");
+    Serial.print(a[i], 6);  // change precision if you want
+  }
+  Serial.println();
+}
+
 
 float arr_max (const float* arr, size_t n) {
   float max = 0;
@@ -159,7 +262,7 @@ void arr_probn (float* arr, size_t n) {
 
 void setup() {
   servo1.attach(servopin);
-  servo_step = 360 / num_positions;
+  servo_step = 180 / (num_positions - 1);
 
   servo1.write(0);
   delay(15);    
@@ -197,11 +300,14 @@ void loop() {
     // 1) Sweep: sample distances at evenly spaced angles
     for (int i = 0; i < num_positions; i++) {
       int angle = i * servo_step;      // map index to angle
+      Serial.println(angle);
       servo1.write(angle);
       delay(100);
       dis[i] = read_ultrasonic(trig2, echo2); // cm
+      if (dis[i] < 6) {
+        autonomous_mode_objectfollow = false;
+      }
     }
-
     // 2) Normalize distances to 0..1 by dividing by max
     float maxVal = arr_max(dis, num_positions);
     if (maxVal <= 0.0001) maxVal = 1.0;
@@ -209,31 +315,24 @@ void loop() {
 
     // 3) Convert to likelihood: closer -> higher (1 - normalized distance)
     arr_mirror1(dis, prob, num_positions);
-
+    int tmp_best_idx = arr_maxi(prob, num_positions);
     // 4) Multiply prior (beliefs) by likelihoods (Bayes update)
     arr_mul(beliefs, prob, num_positions);
+    int best_idx = arr_maxi(beliefs, num_positions);
 
-    // 5) Renormalize beliefs to sum to 1
-    arr_probn(beliefs, num_positions);
 
-    int best_idx =
-      /* preferred if you fixed arr_maxi: */ arr_maxi(beliefs, num_positions);
-      /* or, if you kept your old arr_maxi:  argmax_idx(beliefs, num_positions); */
-
-    int best_angle = best_idx * servo_step;      // 0..180, 0 = rightmost
-    int bin = best_angle / (180 / 8);            // 8 bins across the scan (0..7)
-    if (bin < 0) bin = 0; if (bin > 7) bin = 7;
-
-    switch (bin) {
-      case 0: dir_right_hard();   break; // ~0°–22°
-      case 1: dir_right();        break; // ~22°–45°
-      case 2: dir_right_slight(); break; // ~45°–67°
-      case 3: dir_forward_right();break; // ~67°–90°
-      case 4: dir_forward_left(); break; // ~90°–112°
-      case 5: dir_left_slight();  break; // ~112°–135°
-      case 6: dir_left();         break; // ~135°–157°
-      default: dir_left_hard();   break; // ~157°–180°
+    switch (best_idx) {
+      case 0: direction0();   break;
+      case 1: direction22();        break;
+      case 2: direction44(); break;
+      case 3: direction66();break;
+      case 4: direction88(); break;
+      case 5: direction110();  break;
+      case 6: direction132();         break;
+      case 7: direction156();         break;
+      default: direction176();   break;
     }
+    arr_probn(beliefs, num_positions);
   }
   if (Serial.available()) {
     char command = Serial.read();
@@ -308,6 +407,21 @@ void loop() {
           case 255:
             autonomous_mode = !autonomous_mode;
             drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
+            break;
+          case 65:
+            servo_dir -= servo_step;
+            servo1.write(servo_dir);
+            Serial.print(servo_dir);
+            delay(100);
+            break; 
+          case 66:
+            servo_dir += servo_step;
+            servo1.write(servo_dir);
+            Serial.print(servo_dir);
+            delay(100); 
+            break;
+          case 100: 
+            testDirection();
             break;
           default:
             drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
