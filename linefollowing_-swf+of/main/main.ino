@@ -9,6 +9,10 @@
 #define trig2 6
 #define echo1 5
 #define echo2 9
+#define leftir A0
+#define midir A1
+#define rightir A2
+
 //sensor 1 side, sensor 2 front
 #include <WiFiS3.h>
 #include <Servo.h>
@@ -16,8 +20,21 @@ IPAddress AP_IP(192, 168, 4, 1);
 IPAddress AP_GW(192, 168, 4, 1);
 IPAddress AP_SN(255, 255, 255, 0);
 
+enum MovState {
+  FORWARD,
+  ROTLEFT,
+  ROTRIGHT
+};
+
+MovState prevState = FORWARD;
+MovState currState = FORWARD;
+int leftBuffer[9];
+int midBuffer[9];
+int rightBuffer[9];
+int IRBufferCounter = 0;
 
 Servo servo1;
+
 const int num_positions = 9;
 int servo_dir = 0;
 int servo_step;
@@ -26,45 +43,6 @@ int servo_step;
 float beliefs[num_positions];
 float dis[num_positions];
 float prob[num_positions];
-
-void testDirection () {
-    // 1) Sweep: sample distances at evenly spaced angles
-    for (int i = 0; i < num_positions; i++) {
-      int angle = i * servo_step;      // map index to angle
-      Serial.println(angle);
-      servo1.write(angle);
-      delay(100);
-      dis[i] = read_ultrasonic(trig2, echo2); // cm
-    }
-
-  Serial.print("Raw Distance: ");
-  printFloat9(dis);
-    // 2) Normalize distances to 0..1 by dividing by max
-    float maxVal = arr_max(dis, num_positions);
-    if (maxVal <= 0.0001) maxVal = 1.0;
-    arr_div(dis, num_positions, maxVal);
-
-  Serial.print("Normalized Distance: ");
-  printFloat9(dis);
-
-    // 3) Convert to likelihood: closer -> higher (1 - normalized distance)
-    arr_mirror1(dis, prob, num_positions);
-
-  Serial.print("Probability: ");
-  printFloat9(prob);
-  
-    // 4) Multiply prior (beliefs) by likelihoods (Bayes update)
-    arr_mul(beliefs, prob, num_positions);
-
-  Serial.print("Updated Belief: ");
-  printFloat9(beliefs);
-
-    int best_idx = arr_maxi(beliefs, num_positions);
-
-  Serial.print("Decision");
-  Serial.print(best_idx);
-  arr_probn(beliefs, num_positions);
-}
 
 void direction176 () {
   drive(0, HIGH, HIGH, 0, 160, 160);
@@ -137,7 +115,7 @@ void direction0() {
 }
 
 void goForward() {
-  drive(0, HIGH, 0, HIGH, 133, 133);
+  drive(0, HIGH, 0, HIGH, 70, 70);
 }
 
 void strongLeftTurn() {
@@ -146,6 +124,14 @@ void strongLeftTurn() {
 
 void strongRightTurn() {
   drive(HIGH, 0, 0, HIGH, 170, 170);
+}
+
+void leftRot() {
+  drive(0, HIGH, HIGH, 0, 110, 110);
+}
+
+void rightRot() {
+  drive(HIGH, 0, 0, HIGH, 110, 110);
 }
 
 void turnLeft(int speed) {
@@ -158,8 +144,37 @@ void stopDrive() {
   drive(0, 0, 0, 0, 0, 0);
 }
 
+int IRBufFilter(const int* buf) {
+  int cnt = 0;
+  for (int i = 0; i < 9; i++){
+    if(buf[i] > 0) {
+      cnt++;
+    }
+  }
+  if(cnt >= 5) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+int IRBufFilterTmp(const int* buf) {
+  int cnt = 0;
+  for (int i = 0; i < 3; i++){
+    if(buf[i] > 0) {
+      cnt++;
+    }
+  }
+  if(cnt >= 2) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
 boolean autonomous_mode = 0;
 boolean autonomous_mode_objectfollow = 0;
+boolean autonomous_mode_linefollow = 0;
 
 const char* ssid = "ARDUINO_FINAL_BOSS";  // open AP (no password)
 WiFiServer server(80);
@@ -178,7 +193,7 @@ String htmlPage() {
   <!doctype html><html><head><meta charset="utf-8"/>
   <title>WASD Control</title>
   <script>
-  const CMD={W:1,A:4,S:2,D:5,STOP:7, M:255, N:254, F: 65, G: 66, Z: 100};
+  const CMD={W:1,A:4,S:2,D:5,STOP:7, M:255, N:254, B: 101, F: 65, G: 66, Q: 128, E: 129};
   let pressed=new Set();
   async function send(b){
     fetch('/api/cmd?b='+b).catch(()=>{});
@@ -260,6 +275,79 @@ void arr_probn (float* arr, size_t n) {
   }
 }
 
+void fineturnDirection(bool direction) { // 0 left 1 right
+  // Use a small buffer of 3 values;
+  int counter = 0;
+  int leftBufTmp[3];
+  int midBufTmp[3];
+  int rightBufTmp[3];
+  
+  while (true) {
+      int leftJudge = digitalRead(leftir);
+      int midJudge = digitalRead(midir);
+      int rightJudge = digitalRead(rightir);
+      if (!direction) {
+        // left case
+        if (leftJudge == 0 && rightJudge == 1) {
+          Serial.print("lefttune");
+          leftRot();
+          currState = ROTLEFT;
+        } else {
+          currState = FORWARD;
+          return ;
+        }
+      } else {
+        //right case
+        if (leftJudge == 1 && rightJudge == 0) {
+          Serial.print("righttune");
+          rightRot();
+          currState = ROTRIGHT;
+        } else {
+          currState = FORWARD;
+          return ;
+        }
+      }
+  //   if (counter >= 2) {
+  //     counter = 0;
+  //     int leftJudge = IRBufFilterTmp(leftBuffer);
+  //     int midJudge = IRBufFilterTmp(midBuffer);
+  //     int rightJudge = IRBufFilterTmp(rightBuffer);
+
+  //     if (direction) {
+  //       // left case
+  //       if (leftJudge == 0 && rightJudge == 1) {
+  //         Serial.print("lefttune");
+  //         leftRot();
+  //         currState = ROTLEFT;
+  //       } else {
+  //         currState = FORWARD;
+  //         return ;
+  //       }
+  //     } else {
+  //       //right case
+  //       if (leftJudge == 1 && rightJudge == 0) {
+  //         Serial.print("righttune");
+  //         rightRot();
+  //         currState = ROTRIGHT;
+  //       } else {
+  //         currState = FORWARD;
+  //         return ;
+  //       }
+  //     }
+  //   } else {
+  //     counter++;
+  //     int leftVal = digitalRead(leftir);
+  //     int midVal = digitalRead(midir);
+  //     int rightVal = digitalRead(rightir);
+  //     leftBufTmp[counter] = leftVal;
+  //     midBufTmp[counter] = midVal;
+  //     rightBufTmp[counter] = rightVal;
+  //   }
+  delay(20);
+  stopDrive();
+  delay(10);
+  }
+}
 void setup() {
   servo1.attach(servopin);
   servo_step = 180 / (num_positions - 1);
@@ -290,12 +378,80 @@ void setup() {
   pinMode(in1_2, OUTPUT);
   pinMode(in2_2, OUTPUT);
   pinMode(in1_2, OUTPUT);
+
+  pinMode(leftir, INPUT);
+  pinMode(midir, INPUT);
+  pinMode(rightir, INPUT);
 //  pinMode(encleft, INPUT_PULLUP);
   //pinMode(encright, INPUT_PULLUP);
   Serial.begin(115200);
 }
 
 void loop() {
+  if (autonomous_mode_linefollow) {
+    int leftVal = digitalRead(leftir);
+    int midVal = digitalRead(midir);
+    int rightVal = digitalRead(rightir);
+    Serial.print(leftVal);
+    Serial.print(" ");
+    Serial.print(midVal);
+    Serial.print(" ");
+    Serial.println(rightVal);
+
+    switch (currState) {
+      case FORWARD:
+        //goForward();
+      break;
+      case ROTLEFT:
+        //fineturnDirection(0);
+      break;
+      case ROTRIGHT:
+        //fineturnDirection(1);
+      break;
+    }
+
+      int leftJudge = leftVal;
+      int midJudge = midVal;
+      int rightJudge = rightVal;
+
+      if (leftJudge == 1 && rightJudge == 1 && midJudge == 0) {
+        currState = FORWARD;
+        goForward();
+      } else if (leftJudge == 0 && rightJudge == 1) {
+        currState = ROTLEFT;
+        fineturnDirection(0);
+      }  else if (leftJudge == 1 && rightJudge == 0) {
+       currState = ROTRIGHT;
+       fineturnDirection(1);
+      } else {
+        currState = FORWARD;
+        goForward();
+      }
+    // if (IRBufferCounter >= 9) {
+    //   IRBufferCounter = 0;
+    //   int leftJudge = IRBufFilter(leftBuffer);
+    //   int midJudge = IRBufFilter(midBuffer);
+    //   int rightJudge = IRBufFilter(rightBuffer);
+
+    //   if (leftJudge == 1 && rightJudge == 1 && midJudge == 0) {
+    //     currState = FORWARD;
+    //   } else if (leftJudge == 0 && rightJudge == 1) {
+    //     fineturnDirection(0);
+    //   }  else if (leftJudge == 1 && rightJudge == 0) {
+    //     rightRot();
+    //     fineturnDirection(1);
+    //   } else {
+    //     currState = FORWARD;
+    //   }
+    // } else {
+    //   leftBuffer[IRBufferCounter] = leftVal;
+    //   midBuffer[IRBufferCounter] = midVal;
+    //   rightBuffer[IRBufferCounter] = rightVal;
+    //   IRBufferCounter ++;
+    // }
+    delay(10);
+  }
+
   if (autonomous_mode_objectfollow) {
     // 1) Sweep: sample distances at evenly spaced angles
     for (int i = 0; i < num_positions; i++) {
@@ -420,8 +576,15 @@ void loop() {
             Serial.print(servo_dir);
             delay(100); 
             break;
-          case 100: 
-            testDirection();
+          case 128:
+            leftRot();
+            break;
+          case 129:
+            rightRot();
+            break;  
+          case 101:
+            autonomous_mode_linefollow = !autonomous_mode_linefollow;
+            drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
             break;
           default:
             drive(lowVol, lowVol, lowVol, lowVol, speed, speed);
