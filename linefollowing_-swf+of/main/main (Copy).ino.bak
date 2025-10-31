@@ -28,12 +28,21 @@ enum MovState {
 
 MovState prevState = FORWARD;
 MovState currState = FORWARD;
+int leftBuffer[9];
+int midBuffer[9];
+int rightBuffer[9];
+int IRBufferCounter = 0;
 
 Servo servo1;
 
 const int num_positions = 9;
 int servo_dir = 0;
 int servo_step;
+
+
+float beliefs[num_positions];
+float dis[num_positions];
+float prob[num_positions];
 
 void direction176 () {
   drive(0, HIGH, HIGH, 0, 160, 160);
@@ -106,7 +115,7 @@ void direction0() {
 }
 
 void goForward() {
-  drive(0, HIGH, 0, HIGH, 110, 110);
+  drive(0, HIGH, 0, HIGH, 120, 120);
 }
 
 void goBackward() {
@@ -122,11 +131,11 @@ void strongRightTurn() {
 }
 
 void leftRot() {
-  drive(0, HIGH, HIGH, 0, 80, 80);
+  drive(0, HIGH, HIGH, 0, 90, 90);
 }
 
 void rightRot() {
-  drive(HIGH, 0, 0, HIGH, 80, 80);
+  drive(HIGH, 0, 0, HIGH, 90, 90);
 }
 
 void turnLeft(int speed) {
@@ -169,21 +178,35 @@ const uint8_t CMD_S = 0b00000010;
 const uint8_t CMD_D = 0b00000011;
 const uint8_t CMD_STOP = 0b00000111;
 
-const char page[] PROGMEM = 
-"<!doctype html><html><head><meta charset=\"utf-8\"/>"
-"<title>WASD Control</title>"
-"<script>"
-"const CMD={W:1,A:4,S:2,D:5,STOP:7,M:255,N:254,B:101,F:65,G:66,Q:128,E:129};"
-"let pressed=new Set();"
-"async function send(b){fetch('/api/cmd?b='+b).catch(()=>{});} "
-"function down(k){if(!pressed.has(k)){pressed.add(k);send(CMD[k]);}} "
-"function up(k){if(pressed.has(k)){pressed.delete(k);} if(pressed.size==0) send(CMD.STOP);} "
-"window.addEventListener('keydown',e=>{const k=e.key.toUpperCase();if(CMD[k]){e.preventDefault();down(k);}});"
-"window.addEventListener('keyup',e=>{const k=e.key.toUpperCase();if(CMD[k]){e.preventDefault();up(k);}});"
-"</script></head><body>"
-"<h1>WASD Controller</h1>"
-"<p>Use keyboard W/A/S/D. Releases → Stop. M Autonomous, N Object following</p>"
-"</body></html>";
+String htmlPage() {
+  return R"HTML(
+  <!doctype html><html><head><meta charset="utf-8"/>
+  <title>WASD Control</title>
+  <script>
+  const CMD={W:1,A:4,S:2,D:5,STOP:7, M:255, N:254, B: 101, F: 65, G: 66, Q: 128, E: 129};
+  let pressed=new Set();
+  async function send(b){
+    fetch('/api/cmd?b='+b).catch(()=>{});
+  }
+  function down(k){
+    if(!pressed.has(k)){ pressed.add(k); send(CMD[k]); }
+  }
+  function up(k){
+    if(pressed.has(k)){ pressed.delete(k); }
+    if(pressed.size==0) send(CMD.STOP);
+  }
+  window.addEventListener('keydown',e=>{
+    const k=e.key.toUpperCase(); if(CMD[k]){ e.preventDefault(); down(k); }
+  });
+  window.addEventListener('keyup',e=>{
+    const k=e.key.toUpperCase(); if(CMD[k]){ e.preventDefault(); up(k); }
+  });
+  </script></head><body>
+  <h1>WASD Controller</h1>
+  <p>Use keyboard W/A/S/D. Releases → Stop. M Autonomous, N Object following</p>
+  </body></html>
+  )HTML";
+}
 
 int speed = 255;
 int lowVol = 0;
@@ -194,6 +217,52 @@ void printFloat9(const float a[9]) {
     Serial.print(a[i], 6);  // change precision if you want
   }
   Serial.println();
+}
+
+
+float arr_max (const float* arr, size_t n) {
+  float max = 0;
+  for (int i = 0; i<n; i++) {
+    if (arr[i] > max) max = arr[i];
+  }
+  return max;
+}
+
+int arr_maxi(const float* arr, size_t n) {
+  int idx = 0;
+  float mx = arr[0];
+  for (size_t i = 1; i < n; ++i) {
+    if (arr[i] > mx) { mx = arr[i]; idx = (int)i; }
+  }
+  return idx;
+}
+
+void arr_div (float* arr, size_t n, float a) {
+  for (int i = 0; i<n; i++) {
+    arr[i] = arr[i] / a;
+  }
+}
+
+void arr_mul (float* arr1, float* arr2, size_t n) {
+  for (int i = 0; i<n; i++) {
+    arr1[i] = arr1[i] * arr2[i];
+  }
+}
+
+void arr_mirror1 (float* arr1, float* arr2, size_t n) {
+  for (int i = 0; i<n; i++) {
+    arr2[i] = 1 - arr1[i];
+  }
+}
+
+void arr_probn (float* arr, size_t n) {
+  float sum = 0;
+  for (int i = 0; i<n; i++) {
+    sum += arr[i];
+  }
+  for (int i = 0; i<n; i++) {
+    arr[i] = arr[i] / sum;
+  }
 }
 
 void fineturnDirection(bool direction) { // 0 left 1 right
@@ -215,31 +284,26 @@ void fineturnDirection(bool direction) { // 0 left 1 right
         // Before going forward, we want to check if we are really at the position
         stopDrive();
         int score = 0;
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 3; i++) {
           int v1 = digitalRead(leftir);
           int v2 = digitalRead(midir);
           int v3 = digitalRead(rightir);
-          if (v1 == 1 && v2 == 0 && v3 == 1) {
+          if (v1 == 0 && v2 == 1 && v3 == 0) {
             score++;
           } 
-          delay(4);
+          delay(3);
         }
-        if (score >= 3) {
+        if (score >= 2) {
           goForward();
           return;
         } else {
-          if (currState == FORWARD) {
-            goForward();
-          } else if (currState == ROTLEFT) {
-            leftRot();
-          } else if (currState == ROTRIGHT) {
-            rightRot();
-          } 
           continue;
         }
       } else if (midJudge == 1 && leftJudge == 1 && rightJudge == 1) {
-        // for now, continue the previous state
-        continue;
+        // no longer on the line, try adjusting back a little bit then return;
+        goBackward(); 
+        delay(100);
+        return;
       }
   }
 }
@@ -249,6 +313,10 @@ void setup() {
 
   servo1.write(0);
   delay(15);    
+  for (int i = 0; i < num_positions; i++) {
+    beliefs[i] = 1.0 / num_positions;
+    dis[i] = 0.0;
+  }
   Serial1.begin(SERIAL_BAUD);  // UART to robot
   if (WiFi.beginAP(ssid) != WL_AP_LISTENING) {
     Serial.println("AP start failed");
@@ -269,8 +337,6 @@ void setup() {
   pinMode(in1_2, OUTPUT);
   pinMode(in2_2, OUTPUT);
   pinMode(in1_2, OUTPUT);
-
-  pinMode(13, OUTPUT);
 
   pinMode(leftir, INPUT);
   pinMode(midir, INPUT);
@@ -306,30 +372,62 @@ void loop() {
         delay(10);
         if (prevState == FORWARD) {
           leftRot();
-          delay(20); // For now, we want to try to rotate and fine our way back
-          //todo: lost line transition check logic
         } else if (prevState == ROTLEFT) {
+          goBackward();
+          delay(20);
           rightRot();
           delay(30);
         } else if (prevState == ROTRIGHT) {
+          goBackward();
+          delay(20);
           leftRot();
           delay(20);
-        }
+        } 
       } else {
-        // unknown cornercase
-        if (currState == FORWARD) {
-          delay(10);
-          goForward();
-        } else if (currState == ROTLEFT) {
-          delay(10);
-          rightRot();
-        } else if (currState == ROTRIGHT) {
-          delay(10);
-          leftRot();
-        }
+        // unknown cornercase 
+        currState = FORWARD;
         goForward();
-        delay(5);
       }
+    delay(5);
+  }
+
+  if (autonomous_mode_objectfollow) {
+    // 1) Sweep: sample distances at evenly spaced angles
+    for (int i = 0; i < num_positions; i++) {
+      int angle = i * servo_step;      // map index to angle
+      Serial.println(angle);
+      servo1.write(angle);
+      delay(100);
+      dis[i] = read_ultrasonic(trig2, echo2); // cm
+      if (dis[i] < 6) {
+        autonomous_mode_objectfollow = false;
+      }
+    }
+    // 2) Normalize distances to 0..1 by dividing by max
+    float maxVal = arr_max(dis, num_positions);
+    if (maxVal <= 0.0001) maxVal = 1.0;
+    arr_div(dis, num_positions, maxVal);
+
+    // 3) Convert to likelihood: closer -> higher (1 - normalized distance)
+    arr_mirror1(dis, prob, num_positions);
+    int tmp_best_idx = arr_maxi(prob, num_positions);
+    // 4) Multiply prior (beliefs) by likelihoods (Bayes update)
+    arr_mul(beliefs, prob, num_positions);
+    int best_idx = arr_maxi(beliefs, num_positions);
+
+
+    switch (tmp_best_idx) {
+      case 0: direction0();   break;
+      case 1: direction22();        break;
+      case 2: direction44(); break;
+      case 3: direction66();break;
+      case 4: direction88(); break;
+      case 5: direction110();  break;
+      case 6: direction132();         break;
+      case 7: direction156();         break;
+      default: direction176();   break;
+    }
+    arr_probn(beliefs, num_positions);
   }
   if (Serial.available()) {
     char command = Serial.read();
@@ -434,6 +532,7 @@ void loop() {
     }
     client.println("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nOK");
   } else {  // root page
+    String page = htmlPage();
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/html");
     client.println("Connection: close\r\n");
