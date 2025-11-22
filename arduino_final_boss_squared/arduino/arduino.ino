@@ -36,6 +36,7 @@ WiFiServer server(80);
 const char page[] PROGMEM = R"HTML(
 <meta charset=utf-8>
 <style>
+input{width:48px}
 body{margin:8px;font:14px sans-serif}
 .p{display:inline-block;padding:6px;border:1px solid #ccc;border-radius:4px}
 .g{display:grid;grid-template-columns:repeat(4,52px);gap:4px;margin-bottom:4px}
@@ -55,13 +56,40 @@ function refreshState(){
     el.textContent=JSON.stringify(s,null,2);
   }).catch(()=>{});
 }
+function swapScan(){
+  fetch("/api/swap").then(r=>r.json()).then(s=>{
+    const el=document.getElementById("state");if(!el)return;
+    el.textContent=JSON.stringify(s,null,2);
+  }).catch(()=>{});
+}
 addEventListener("keydown",e=>{const k=e.key.toUpperCase();if(C[k]){e.preventDefault();d(k)}})
 addEventListener("keyup",e=>{const k=e.key.toUpperCase();if(C[k]){e.preventDefault();u(k)}})
 addEventListener("pointerdown",e=>{const k=e.target.dataset.k;if(k&&C[k]){e.preventDefault();d(k)}})
 addEventListener("pointerup",e=>{const k=e.target.dataset.k;if(k&&C[k]){e.preventDefault();u(k)}})
 addEventListener("DOMContentLoaded",()=>{
   for(const x of document.querySelectorAll("[data-k]"))B[x.dataset.k]=x;
-  const r=document.getElementById("refresh");if(r)r.onclick=e=>{e.preventDefault();refreshState()};
+
+  const r=document.getElementById("refresh");
+  if(r)r.onclick=e=>{e.preventDefault();refreshState()};
+
+  const swap=document.getElementById("swap");
+  if(swap)swap.onclick=e=>{e.preventDefault();swapScan()};
+
+  const servoGo=document.getElementById("servoGo");
+  if(servoGo)servoGo.onclick=e=>{
+    e.preventDefault();
+    const v=parseInt(document.getElementById("servoIndex").value,10);
+    if(Number.isNaN(v))return;
+    fetch("/api/servo?i="+v).catch(()=>{});
+  };
+
+  const driveGo=document.getElementById("driveGo");
+  if(driveGo)driveGo.onclick=e=>{
+    e.preventDefault();
+    const v=parseInt(document.getElementById("driveIndex").value,10);
+    if(Number.isNaN(v))return;
+    fetch("/api/driveIndex?i="+v).catch(()=>{});
+  };
 });
 </script>
 <p>Z→Main/Auto,M→Wall,N→Obj,B→Line,X→Tournament</p>
@@ -72,6 +100,21 @@ addEventListener("DOMContentLoaded",()=>{
     <button data-k=Z>Z</button><button data-k=X>X</button>
   </div>
   <button id=refresh>⟳ State</button>
+  <button id=swap>⟳ Swapscan</button>
+
+  <div style="margin-top:4px">
+    <label>Servo index:
+      <input id="servoIndex" type="number" min="0" max="8">
+    </label>
+    <button id="servoGo">Set servo</button>
+  </div>
+
+  <div style="margin-top:4px">
+    <label>Drive index:
+      <input id="driveIndex" type="number" min="0" max="8">
+    </label>
+    <button id="driveGo">Run drive</button>
+  </div>
 </div>
 <pre id=state></pre>
 )HTML";
@@ -133,16 +176,14 @@ double objDistance[numPosition];
 double objProbability[numPosition];
 
 // Wall-following PD Controller parameters
-int ePrev; // e[k-1];
-int eCurr; // e[k];
-float kP = 2.0; // K_p
-float kD = 0.2; // K_d
-int baseSpeed = 140;
-int tS = 50; // 0.05s
-int dRef = 20; // 30cm
+int ePrev;       // e[k-1], e[k] should be measured by loop
+float kP = 8;  // K_p
+float kD = 2;  // K_d
+int baseSpeed = 120;
+int tS = 50;    // 0.05s
+int dRef = 20;  // 30cm
+int dK;
 int uK;
-int leftSpeed;
-int rightSpeed;
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
@@ -252,7 +293,7 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
   int counter = 0;  // Force quit on 200000;
   while (true) {
     counter++;
-    if(counter >= 30000) {
+    if (counter >= 30000) {
       goForward();
       delay(5);
       stopDrive();
@@ -289,27 +330,27 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
         goForward();
         return false;
       } else if (leftJudge == 1 && midJudge == 0 && rightJudge == 0) {
-          if(!direction) {
-            goForward();
-            delay(20);
-            stopDrive();
-            continue;
-          } else {
-            continue;
-          }
-      } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 1) {
-          if(!direction) {
-            continue;
-          } else {
-            goForward();
-            delay(20);
-            stopDrive();
-            continue;
-          }
-      } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 0) {
+        if (!direction) {
           goForward();
           delay(20);
           stopDrive();
+          continue;
+        } else {
+          continue;
+        }
+      } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 1) {
+        if (!direction) {
+          continue;
+        } else {
+          goForward();
+          delay(20);
+          stopDrive();
+          continue;
+        }
+      } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 0) {
+        goForward();
+        delay(20);
+        stopDrive();
       } else {
         if (currState == FORWARD) {
           goForward();
@@ -325,7 +366,7 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
       //   digitalWrite(13, HIGH);
       //   return true;
       // } else {
-        continue;
+      continue;
       // }
     }
   }
@@ -351,20 +392,20 @@ boolean lineFollowingFrame() {
     delay(17);
     stopDrive();
     delay(2);
-  } else if (leftJudge == 0  && midJudge == 0 && rightJudge == 1) {
+  } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 1) {
     prevState = currState;
     fineturnDirection(0);
-  } else if (leftJudge == 0  && midJudge == 1 && rightJudge == 1) {
+  } else if (leftJudge == 0 && midJudge == 1 && rightJudge == 1) {
     goForward();
     delay(6);
     stopDrive();
     delay(2);
     prevState = currState;
     fineturnDirection(0);
-  } else if (leftJudge == 1  && midJudge == 0 && rightJudge == 0) {
+  } else if (leftJudge == 1 && midJudge == 0 && rightJudge == 0) {
     prevState = currState;
     fineturnDirection(1);
-  } else if (leftJudge == 1  && midJudge == 1 && rightJudge == 0) {
+  } else if (leftJudge == 1 && midJudge == 1 && rightJudge == 0) {
     goForward();
     delay(6);
     stopDrive();
@@ -390,7 +431,7 @@ boolean lineFollowingFrame() {
         delay(20);
       }
     }
-  } else { // 000 010
+  } else {  // 000 010
     if (prevState == FORWARD) {
       delay(10);
       goForward();
@@ -408,9 +449,39 @@ boolean lineFollowingFrame() {
 }
 
 boolean wallFollowingFrame() {
-  stopDrive();
-  systemState = MANUAL;
-  return true;
+  double frontLeftReading = read_ultrasonic(trig2, echo2);
+  double rightReading = read_ultrasonic(trig1, echo1);
+  int leftJudge = digitalRead(leftir);
+  int midJudge = digitalRead(midir);
+  int rightJudge = digitalRead(rightir);
+
+  float e = dRef - rightReading;
+  if (frontLeftReading < 20) {
+    rotLeft();
+    delay(10);
+    return false;
+  } else {
+    float de = (eCurr - ePrev) / tS;
+    float u_raw = kP * e + kD * de;
+
+    if (u_raw > 40)  u_raw = 40;
+    if (u_raw < -40) u_raw = -40;
+
+    left_pwm  = constrain(left_pwm,  0, 255);
+    right_pwm = constrain(right_pwm, 0, 255);
+
+    drive(LOW, HIGH, LOW, HIGH, left_pwm, right_pwm);
+  }
+  if (objectFollowingCriteria(leftJudge, midJudge, rightJudge, frontLeftReading, rightReading)) {
+    stopDrive();
+    delay(10);
+    goForward();
+    delay(500);
+    stopDrive();
+    return true;
+  } else {
+    return false;
+  }
 }
 
 boolean wallFollowingCriteria() {
@@ -427,12 +498,14 @@ boolean wallFollowingCriteria() {
 
 boolean objectFollowingFrame() {
   // Sweeping
+  servo1.write(0);
+  delay(500);
   for (int i = 0; i < numPosition; i++) {
     int angle = i * servoStep;
     servo1.write(angle);
-    delay(180);
-    objDistance[i] = read_ultrasonic(trig2, echo2);
-    if (objDistance[i] < 5) {
+    delay(200);
+    objDistance[i] = read_ultrasonic(trig2, echo2, 50000UL);
+    if (objDistance[i] < 6) {
       return true;
     }
   }
@@ -452,6 +525,14 @@ boolean objectFollowingFrame() {
   return false;
 }
 
+boolean objectFollowingCriteria(int IR1, int IR2, int IR3, int sonic1, int sonic2) {
+  if ((ir1 == 0 || ir2 == 0 || ir3 == 0) && sonic1 > 100) { 
+    // hit marker and front sonic reads high
+    return true;
+  } else {
+    return false;
+  }
+}
 
 void wifiHandler(WiFiClient client) {
   String req = client.readStringUntil('\r');
@@ -549,6 +630,65 @@ void wifiHandler(WiFiClient client) {
     client.print(",\"sideDistance\":");
     client.print(sideDistance);
     client.print("}");
+  } else if (req.startsWith("GET /api/swap")) {
+    servo1.write(0);
+    delay(500);
+    for (int i = 0; i < numPosition; i++) {
+      int angle = i * servoStep;
+      servo1.write(angle);
+      delay(200);
+      objDistance[i] = read_ultrasonic(trig2, echo2, 50000UL);
+    }
+    double maxVal = arr_maxi(objDistance, numPosition);
+    if (maxVal < 0.0001) maxVal = 1.0;
+    arr_div(objDistance, numPosition, maxVal);
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close\r\n");
+    client.print("{\"result\":\"");
+    for (int i = 0; i < numPosition; i++) {
+      client.print(objDistance[i]);
+      client.print(" ");
+    }
+    client.print("\"}");
+  } else if (req.startsWith("GET /api/servo")) {
+    int iPos = req.indexOf("i=");
+    int idx = 0;
+    if (iPos > 0) {
+      idx = req.substring(iPos + 2).toInt();
+    }
+    if (idx < 0) idx = 0;
+    if (idx >= numPosition) idx = numPosition - 1;
+
+    int angle = idx * servoStep;
+    servo1.write(angle);
+
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close\r\n");
+    client.print("{\"idx\":");
+    client.print(idx);
+    client.print(",\"angle\":");
+    client.print(angle);
+    client.print("}");
+  } else if (req.startsWith("GET /api/driveIndex")) {
+    int iPos = req.indexOf("i=");
+    int idx = 0;
+    if (iPos > 0) {
+      idx = req.substring(iPos + 2).toInt();
+    }
+    if (idx < 0) idx = 0;
+    if (idx >= numPosition) idx = numPosition - 1;
+
+    delayedDrive(objTrackingTranslationTable[idx][0]);
+    delayedDrive(objTrackingTranslationTable[idx][1]);
+
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json");
+    client.println("Connection: close\r\n");
+    client.print("{\"idx\":");
+    client.print(idx);
+    client.print("}");
   } else {  // root page
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: text/html");
@@ -561,6 +701,7 @@ void wifiHandler(WiFiClient client) {
 void delayedDrive(MotorParamDelayed d) {
   paramDrive(d.params);
   delay(d.delay);
+  stopDrive();
   return;
 }
 
@@ -580,6 +721,26 @@ void drive(PinStatus p1, PinStatus p2, PinStatus p3, PinStatus p4, int power1, i
   return;
 }
 
+double read_ultrasonic(int trigPin, int echoPin, unsigned long timeout) {
+  digitalWrite(trigPin, LOW);   // start low to ensure no pulse is sent
+  delayMicroseconds(5);         // ensure 5 microseconds of no signal to avoid interference
+  digitalWrite(trigPin, HIGH);  // start pulse high
+  delayMicroseconds(10);        // continue for 10 microseconds
+  digitalWrite(trigPin, LOW);   // stop pulse
+
+  // Measure length of time before pulse comes in
+  double duration = pulseIn(echoPin, HIGH, timeout);
+
+  // Convert the time into a distance
+  double cm = (duration / 2) / 29.1;  // Divide by 29.1 or multiply by 0.0343
+
+  if (duration == 0) {
+    return 9999.0;
+  }
+
+  return cm;
+}
+
 double read_ultrasonic(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);   // start low to ensure no pulse is sent
   delayMicroseconds(5);         // ensure 5 microseconds of no signal to avoid interference
@@ -588,14 +749,17 @@ double read_ultrasonic(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);   // stop pulse
 
   // Measure length of time before pulse comes in
-  double duration = pulseIn(echoPin, HIGH);
+  double duration = pulseIn(echoPin, HIGH, 18000UL);
 
   // Convert the time into a distance
   double cm = (duration / 2) / 29.1;  // Divide by 29.1 or multiply by 0.0343
 
+  if (duration == 0) {
+    return 9999.0;
+  }
+
   return cm;
 }
-
 // Predefined driving parameters
 void stopDrive() {
   drive(LOW, LOW, LOW, LOW, 0, 0);
