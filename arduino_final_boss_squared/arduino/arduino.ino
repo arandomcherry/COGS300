@@ -47,6 +47,11 @@ body{margin:8px;font:14px sans-serif}
 button{height:40px;border:1px solid #ccc;background:#f8f8f8;cursor:pointer}
 button.on{background:#cfe8ff;border-color:#7aa}
 #state{margin-top:8px;padding:4px;border:1px solid #eee;background:#fafafa;font:12px monospace;max-height:160px;overflow:auto;white-space:pre}
+#heatmapBox{margin-top:8px;padding:4px;border:1px solid #eee;border-radius:4px;background:#fdfdfd}
+#heatmapTitle{font-size:13px;margin-bottom:2px}
+.heatmap{display:flex;gap:2px;align-items:flex-end;margin-top:4px}
+.heatcell{flex:1;height:28px;border-radius:3px;background:#eee;transition:background .15s}
+#heatmapLegend{font-size:11px;color:#666;margin-top:4px}
 </style>
 <script>
 const C={W:1,A:4,S:2,D:5,Q:8,E:9,STOP:7,M:255,N:254,B:101,X:100,Z:50,I:150},p=new Set,m=new Set("WASD"),B={};
@@ -60,10 +65,63 @@ function refreshState(){
     el.textContent=JSON.stringify(s,null,2);
   }).catch(()=>{});
 }
+function ensureHeatmap(count){
+  const box=document.getElementById("heatmap");
+  if(!box)return;
+  if(box.children.length===count)return;
+  box.innerHTML="";
+  for(let i=0;i<count;i++){
+    const cell=document.createElement("div");
+    cell.className="heatcell";
+    box.appendChild(cell);
+  }
+}
+function renderHeatmap(values){
+  const box=document.getElementById("heatmap");
+  if(!box||!values.length)return;
+  ensureHeatmap(values.length);
+
+  let min=values[0],max=values[0];
+  for(const v of values){
+    if(!Number.isFinite(v))continue;
+    if(v<min)min=v;
+    if(v>max)max=v;
+  }
+  const span=(max-min)||1;
+
+  // Left (index 0) → servo at 0°, right → 180°
+  const cells=[...box.children];
+  cells.forEach((cell,idx)=>{
+    const v=values[idx];
+    if(!Number.isFinite(v)){
+      cell.style.background="#eee";
+      return;
+    }
+    // Normalize 0–1
+    const t=(v-min)/span;
+    // We want **closer = darker**:
+    // If your values are normalized (0=near, 1=far), flip t first:
+    //   const closeness = 1 - t;
+    // If values are raw cm (small=near), closeness = 1 - t still works.
+    const closeness=1-t;
+    const lightness=80-closeness*40; // 40% (very close) → 80% (far)
+    cell.style.backgroundColor=`hsl(210,70%,${lightness}%)`;
+  });
+
+  const legend=document.getElementById("heatmapLegend");
+  if(legend){
+    legend.textContent=
+      `min: ${min.toFixed(1)}  max: ${max.toFixed(1)}  (darker = closer, left = servo 0°)`;
+  }
+}
 function swapScan(){
   fetch("/api/swap").then(r=>r.json()).then(s=>{
-    const el=document.getElementById("state");if(!el)return;
-    el.textContent=JSON.stringify(s,null,2);
+    const stateEl=document.getElementById("state");
+    if(stateEl) stateEl.textContent=JSON.stringify(s,null,2);
+    if(typeof s.result==="string"){
+      const vals=s.result.trim().split(/\s+/).map(Number).filter(v=>Number.isFinite(v));
+      if(vals.length) renderHeatmap(vals);
+    }
   }).catch(()=>{});
 }
 addEventListener("keydown",e=>{const k=e.key.toUpperCase();if(C[k]){e.preventDefault();d(k)}})
@@ -106,6 +164,13 @@ addEventListener("DOMContentLoaded",()=>{
   </div>
   <button id=refresh>⟳ State</button>
   <button id=swap>⟳ Swapscan</button>
+
+  <!-- NEW: heatmap box -->
+  <div id="heatmapBox">
+    <div id="heatmapTitle">Swapscan heatmap</div>
+    <div id="heatmap" class="heatmap"></div>
+    <div id="heatmapLegend"></div>
+  </div>
 
   <div style="margin-top:4px">
     <label>Servo index:
@@ -158,8 +223,11 @@ MovState currState = FORWARD;
 Servo servo1;  // The servo for the front ultrasonic sonar
 
 const int numPosition = 9;        // For object tracking. Number of positions to check and navigate.
+const int numPositionDebug = 30;
 volatile int servoDirection = 0;  // Current direction for servo (front ultrasonic) to take.
-int servoStep;                    // The amount of angle for each step for object tracking
+volatile int servoDirectionDebug = 0; 
+double servoStep;                    // The amount of angle for each step for object tracking
+double servoStepDebug;                    
 
 // All parameters needed for driving
 struct MotorParam {
@@ -179,17 +247,19 @@ struct MotorParamDelayed {
 MotorParamDelayed objTrackingTranslationTable[numPosition][2];
 double objDistance[numPosition];
 double objProbability[numPosition];
+double objDistanceDebug[numPositionDebug];
+double objProbabilityDebug[numPositionDebug];
 
 volatile int leftIRVal;
 volatile int rightIRVal;
 
 // Wall-following PD Controller parameters
 float ePrev;  // e[k-1], e[k] should be measured by loop
-float kP = 3.8f;
+float kP = 5.0f;
 float kD = 1.2f;
 int base_pwm = 80;
 float tS = 0.05f;  // 0.05s
-float dRef = 22.0;     // 10cm
+float dRef = 18.0;     // 10cm
 float dK;
 float uK;
 int left_pwm;
@@ -241,6 +311,11 @@ void setup() {
     objDistance[i] = 0;
   }
 
+  servoStepDebug = 180 / (numPositionDebug - 1);
+
+  for (int i = 0; i < numPositionDebug; i++) {
+    objDistanceDebug[i] = 0;
+  }
   systemState = MANUAL;
   autoState = LINE;
   objTrackingTranslationTable[0][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 400 };
@@ -252,7 +327,7 @@ void setup() {
   objTrackingTranslationTable[3][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 170 };
   objTrackingTranslationTable[3][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
   objTrackingTranslationTable[4][0] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
-  objTrackingTranslationTable[4][1] = { { LOW, LOW, LOW, LOW, 0, 0 }, 0 };  // TODO: optimization to skip 0 timeout
+  objTrackingTranslationTable[4][1] = { { LOW, LOW, LOW, LOW, 0, 0 }, 0 };
   objTrackingTranslationTable[5][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 100 };
   objTrackingTranslationTable[5][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
   objTrackingTranslationTable[6][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 160 };
@@ -331,9 +406,6 @@ void blinkBuiltinLED() {
 
 boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
   if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
-    stopDrive();
-    goForward();
-    delay(1200);
     return true;
   } 
   stopDrive();
@@ -400,12 +472,7 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
       goBackward();
       delay(80);
       stopDrive();
-      // if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
-      //   digitalWrite(13, HIGH);
-      //   return true;
-      // } else {
       continue;
-      // }
     }
   }
 }
@@ -419,11 +486,11 @@ void rotRight() {
 }
 
 void rotLeftTotal() {
-  drive(LOW, HIGH, HIGH, LOW, 82, 82);
+  drive(LOW, HIGH, HIGH, LOW, 90, 90);
 }
 
 void rotRightTotal() {
-  drive(HIGH, LOW, LOW, HIGH, 82, 82);
+  drive(HIGH, LOW, LOW, HIGH, 90, 90);
 }
 
 void IRInterrupt() {
@@ -461,9 +528,6 @@ boolean lineFollowingFrame() {
       stopDrive();
       delay(20);
       if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
-        stopDrive();
-        goForward();
-        delay(1200);
         return true;
       } else {
         // Not following wall and out of line
@@ -619,7 +683,11 @@ boolean wallFollowingCriteria() {
   double frontLeftReading = read_ultrasonic(trig2, echo2);
   double rightReading = read_ultrasonic(trig1, echo1);
 
-  if (frontLeftReading + rightReading < 70) {
+  if ((frontLeftReading + rightReading < 60) || rightReading < 20 || frontLeftReading < 20) {
+    stopDrive();
+    delay(80);
+    goForward();
+    delay(1000);
     return true;
   } else {
     return false;
@@ -639,7 +707,7 @@ boolean objectFollowingFrame() {
       return true;
     }
   }
-  double maxVal = arr_maxi(objDistance, numPosition);
+  double maxVal = arr_max(objDistance, numPosition);
   if (maxVal < 0.0001) maxVal = 1.0;
   arr_div(objDistance, numPosition, maxVal);
   arr_mirror1(objDistance, objProbability, numPosition);
@@ -775,21 +843,22 @@ void wifiHandler(WiFiClient client) {
   } else if (req.startsWith("GET /api/swap")) {
     servo1.write(0);
     delay(500);
-    for (int i = 0; i < numPosition; i++) {
-      int angle = i * servoStep;
+    for (int i = 0; i < numPositionDebug; i++) {
+      int angle = i * servoStepDebug;
       servo1.write(angle);
-      delay(200);
-      objDistance[i] = read_ultrasonic(trig2, echo2, 50000UL);
+      delay(80);
+      objDistanceDebug[i] = read_ultrasonic(trig2, echo2, 100000UL);
+      delay(80);
     }
-    double maxVal = arr_maxi(objDistance, numPosition);
+    double maxVal = arr_max(objDistanceDebug, numPositionDebug);
     if (maxVal < 0.0001) maxVal = 1.0;
-    arr_div(objDistance, numPosition, maxVal);
+    arr_div(objDistanceDebug, numPositionDebug, maxVal);
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: application/json");
     client.println("Connection: close\r\n");
     client.print("{\"result\":\"");
-    for (int i = 0; i < numPosition; i++) {
-      client.print(objDistance[i]);
+    for (int i = 0; i < numPositionDebug; i++) {
+      client.print(objDistanceDebug[i]);
       client.print(" ");
     }
     client.print("\"}");
@@ -936,6 +1005,17 @@ int arr_maxi(const double* arr, size_t n) {
   }
   return idx;
 }
+// Return the maximum value
+double arr_max(const double* arr, size_t n) {
+  double mx = arr[0];
+  for (size_t i = 1; i < n; ++i) {
+    if (arr[i] > mx) {
+      mx = arr[i];
+    }
+  }
+  return mx;
+}
+
 // Convert every element to be 1 - x
 void arr_mirror1(double* arr1, double* arr2, size_t n) {
   for (int i = 0; i < n; i++) {
