@@ -6,22 +6,24 @@
 // Motors, notice that there is a swap in drive() due to wiring mistake.
 #define enA_1 10
 #define enA_2 11
-// Encoders, 1 is left, 2 is right
-#define in1_1 2
+#define in1_1 A0
 #define in2_1 4
 #define in1_2 7
 #define in2_2 8
 // Servo
 #define servopin 12
 // Ultrasonics, 1 is leftside, 2 is frontside.
-#define trig1 3
+#define trig1 A2
 #define trig2 6
 #define echo1 5
 #define echo2 9
 // IR Sensors
-#define leftir A0
+#define leftir 2
 #define midir A1
-#define rightir A2
+#define rightir 3
+
+// syslog
+WiFiUDP udp;
 
 // API Endpoint
 IPAddress AP_IP(192, 168, 4, 1);
@@ -33,6 +35,8 @@ const int SERIAL_BAUD = 115200;
 const char* ssid = "Arduino Final Boss²™";
 const char* pass = "letsalllovelain";
 WiFiServer server(80);
+
+boolean inhibitMovement = false;
 const char page[] PROGMEM = R"HTML(
 <meta charset=utf-8>
 <style>
@@ -45,7 +49,7 @@ button.on{background:#cfe8ff;border-color:#7aa}
 #state{margin-top:8px;padding:4px;border:1px solid #eee;background:#fafafa;font:12px monospace;max-height:160px;overflow:auto;white-space:pre}
 </style>
 <script>
-const C={W:1,A:4,S:2,D:5,Q:8,E:9,STOP:7,M:255,N:254,B:101,X:100,Z:50},p=new Set,m=new Set("WASD"),B={};
+const C={W:1,A:4,S:2,D:5,Q:8,E:9,STOP:7,M:255,N:254,B:101,X:100,Z:50,I:150},p=new Set,m=new Set("WASD"),B={};
 function S(b){fetch("/api/cmd?b="+b).catch(()=>{})}
 function hi(k,on){const b=B[k];if(b)b.classList[on?"add":"remove"]("on")}
 function d(k){if(!p.has(k)){p.add(k);hi(k,1);S(C[k])}}
@@ -92,12 +96,13 @@ addEventListener("DOMContentLoaded",()=>{
   };
 });
 </script>
-<p>Z→Main/Auto,M→Wall,N→Obj,B→Line,X→Tournament</p>
+<p>Z→Main/Auto,M→Wall,N→Obj,B→Line,X→Tournament,(I)nhibitMovements</p>
 <div class=p>
   <div class=g>
     <button data-k=W>W</button><button data-k=A>A</button><button data-k=S>S</button><button data-k=D>D</button>
     <button data-k=STOP>■</button><button data-k=M>M</button><button data-k=N>N</button><button data-k=B>B</button>
     <button data-k=Z>Z</button><button data-k=X>X</button>
+    <button data-k=I>I</button>
   </div>
   <button id=refresh>⟳ State</button>
   <button id=swap>⟳ Swapscan</button>
@@ -175,15 +180,48 @@ MotorParamDelayed objTrackingTranslationTable[numPosition][2];
 double objDistance[numPosition];
 double objProbability[numPosition];
 
+volatile int leftIRVal;
+volatile int rightIRVal;
+
 // Wall-following PD Controller parameters
-int ePrev;       // e[k-1], e[k] should be measured by loop
-float kP = 8;  // K_p
-float kD = 2;  // K_d
-int baseSpeed = 120;
-int tS = 50;    // 0.05s
-int dRef = 20;  // 30cm
-int dK;
-int uK;
+float ePrev;  // e[k-1], e[k] should be measured by loop
+float kP = 3.8f;
+float kD = 1.2f;
+int base_pwm = 80;
+float tS = 0.05f;  // 0.05s
+float dRef = 22.0;     // 10cm
+float dK;
+float uK;
+int left_pwm;
+int right_pwm;
+const float FRONT_MIN = 10;  // cm: "we're about to hit front wall"
+const float RIGHT_MIN = 4;   // cm: "we're scraping right wall"
+
+void syslog(char* msg, size_t len) {
+  // Serial.print("syslog\n");
+  if (!udp.beginPacket("255.255.255.255", 1514)) {
+    Serial.print("beginPacket error.\n");
+    return;
+  }
+  udp.write(msg, len ? len : strlen(msg));
+  // Serial.write("udp.write() done\n");
+  if (!udp.endPacket()) {
+    Serial.print("endPacket error.\n");
+    return;
+  }
+  // Serial.print("syslog done.\n");
+}
+
+void log(const char* fmt, ...) {
+  static char buf[1446];
+  size_t s;
+  size_t s0 = snprintf(buf, sizeof(buf), "[%12ul]: ", millis());
+  va_list list;
+  va_start(list, fmt);
+  s = vsnprintf(buf + s0, sizeof(buf) + s0, fmt, list);
+  va_end(list);
+  syslog(buf, s + s0);
+}
 
 void setup() {
   Serial.begin(SERIAL_BAUD);
@@ -235,11 +273,15 @@ void setup() {
   pinMode(echo1, INPUT);
   pinMode(trig2, OUTPUT);
   pinMode(echo2, INPUT);
-  pinMode(leftir, INPUT);
+  pinMode(leftir, INPUT_PULLUP);
   pinMode(midir, INPUT);
-  pinMode(rightir, INPUT);
+  pinMode(rightir, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(leftir), IRInterrupt, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(rightir), IRInterrupt, CHANGE);
   // System all ready.
+  udp.begin(11451);
   server.begin();
+  log("Setup done.");
 }
 
 void loop() {
@@ -250,6 +292,7 @@ void loop() {
       case LINE:
         if (lineFollowingFrame()) {
           autoState = WALL;
+          servo1.write(90);
         }
         break;
       case WALL:
@@ -287,26 +330,31 @@ void blinkBuiltinLED() {
 }
 
 boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
-  //WiFiClient client = server.available();
+  if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
+    stopDrive();
+    goForward();
+    delay(1200);
+    return true;
+  } 
   stopDrive();
-  delay(30);
+  delay(20);
   int counter = 0;  // Force quit on 200000;
   while (true) {
     counter++;
-    if (counter >= 30000) {
+    if (counter >= 20000) {
       goForward();
-      delay(5);
+      delay(10);
       stopDrive();
       return 0;
     }
     if (!direction) {
       rotLeft();
-      delay(5);
+      delay(3);
       stopDrive();
       currState = ROTLEFT;
     } else {
       rotRight();
-      delay(5);
+      delay(3);
       stopDrive();
       currState = ROTRIGHT;
     }
@@ -314,54 +362,44 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
     int midJudge = digitalRead(midir);
     int rightJudge = digitalRead(rightir);
 
+    if (midJudge == 0) {
+      digitalWrite(13, HIGH);
+    } else {
+      digitalWrite(13, LOW);
+    }
+
     if (leftJudge == 1 && midJudge == 0 && rightJudge == 1) {  // back on line
       stopDrive();
-      int score = 0;
-      for (int i = 0; i < 4; i++) {
-        int leftJudgeTmp = digitalRead(leftir);
-        int midJudgeTmp = digitalRead(midir);
-        int rightJudgeTmp = digitalRead(rightir);
-        if (leftJudgeTmp == 1 && midJudgeTmp == 0 && rightJudgeTmp == 1) {
-          score++;
-        }
-        delay(4);
-      }
-      if (score >= 3) {
-        goForward();
-        return false;
-      } else if (leftJudge == 1 && midJudge == 0 && rightJudge == 0) {
-        if (!direction) {
-          goForward();
-          delay(20);
-          stopDrive();
-          continue;
-        } else {
-          continue;
-        }
-      } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 1) {
-        if (!direction) {
-          continue;
-        } else {
-          goForward();
-          delay(20);
-          stopDrive();
-          continue;
-        }
-      } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 0) {
-        goForward();
-        delay(20);
+      if (!direction) {
+        rotRight();
+        delay(5);
         stopDrive();
       } else {
-        if (currState == FORWARD) {
-          goForward();
-        } else if (currState == ROTLEFT) {
-          rotLeft();
-        } else if (currState == ROTRIGHT) {
-          rotRight();
-        }
+        rotLeft();
+        delay(5);
+        stopDrive();
+      }
+      goForward();
+      return false;
+    } else if (leftJudge == 1 && rightJudge == 0) {
+      if (!direction) {
+        return false;
+      } else {
         continue;
       }
+    } else if (leftJudge == 0 && rightJudge == 1) {
+      if (!direction) {
+        continue;
+      } else {
+        return false;
+        continue;
+      }
+    } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 0) {
+      continue;
     } else if (midJudge == 1 && leftJudge == 1 && rightJudge == 1) {
+      goBackward();
+      delay(80);
+      stopDrive();
       // if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
       //   digitalWrite(13, HIGH);
       //   return true;
@@ -373,104 +411,196 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
 }
 
 void rotLeft() {
-  drive(LOW, HIGH, HIGH, LOW, 0, 82);
+  drive(LOW, HIGH, HIGH, LOW, 0, 84);
 }
 
 void rotRight() {
-  drive(HIGH, LOW, LOW, HIGH, 82, 0);
+  drive(HIGH, LOW, LOW, HIGH, 84, 0);
+}
+
+void rotLeftTotal() {
+  drive(LOW, HIGH, HIGH, LOW, 82, 82);
+}
+
+void rotRightTotal() {
+  drive(HIGH, LOW, LOW, HIGH, 82, 82);
+}
+
+void IRInterrupt() {
+  leftIRVal = digitalRead(leftir);
+  rightIRVal = digitalRead(rightir);
+  if ((leftIRVal == 0 || rightIRVal == 0) && autoState == LINE && systemState != MANUAL) {
+    fullBackward();
+  }
 }
 
 boolean lineFollowingFrame() {
-  int leftJudge = digitalRead(leftir);
   int midJudge = digitalRead(midir);
-  int rightJudge = digitalRead(rightir);
-
-  if (leftJudge == 1 && midJudge == 0 && rightJudge == 1) {
-    prevState = currState;
-    currState = FORWARD;
-    goForward();
-    delay(17);
-    stopDrive();
-    delay(2);
-  } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 1) {
-    prevState = currState;
-    fineturnDirection(0);
-  } else if (leftJudge == 0 && midJudge == 1 && rightJudge == 1) {
-    goForward();
-    delay(6);
-    stopDrive();
-    delay(2);
-    prevState = currState;
-    fineturnDirection(0);
-  } else if (leftJudge == 1 && midJudge == 0 && rightJudge == 0) {
-    prevState = currState;
-    fineturnDirection(1);
-  } else if (leftJudge == 1 && midJudge == 1 && rightJudge == 0) {
-    goForward();
-    delay(6);
-    stopDrive();
-    delay(2);
-    prevState = currState;
-    fineturnDirection(1);
-  } else if (leftJudge == 1 && rightJudge == 1 && midJudge == 1) {
-    // Out of line, recover, and potentially we want to check for wall following now
-    if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
-      return true;
-    } else {
-      // Not following wall and out of line
+  if (midJudge == 0) {
+    digitalWrite(13, HIGH);
+    if (leftIRVal == 0) {
+      prevState = currState;
+      return fineturnDirection(0);
+    } else if (rightIRVal == 0) {
+      prevState = currState;
+      return fineturnDirection(1);
+    } else {  // 1 0 1
+      prevState = currState;
+      currState = FORWARD;
+      goForward();
+    }
+  } else {  // midJudge = 1
+    digitalWrite(13, LOW);
+    if (leftIRVal == 0) {
+      prevState = currState;
+      return fineturnDirection(0);
+    } else if (rightIRVal == 0) {
+      prevState = currState;
+     return  fineturnDirection(1);
+    } else {  // 1 1 1
       stopDrive();
-      delay(10);
-      if (prevState == FORWARD) {
-        rotLeft();  // TODO: better return logic;
-        delay(20);
-      } else if (prevState == ROTLEFT) {
-        rotRight();
-        delay(20);
-      } else if (prevState == ROTRIGHT) {
-        rotLeft();
-        delay(20);
+      delay(20);
+      if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
+        stopDrive();
+        goForward();
+        delay(1200);
+        return true;
+      } else {
+        // Not following wall and out of line
+        if (prevState == FORWARD) {
+          goBackward();
+          delay(10);
+        } else if (prevState == ROTLEFT) {
+          currState = ROTRIGHT;
+          rotRight();
+          delay(15);
+        } else if (prevState == ROTRIGHT) {
+          currState = ROTLEFT;
+          rotLeft();
+          delay(15);
+        }
       }
     }
-  } else {  // 000 010
-    if (prevState == FORWARD) {
-      delay(10);
-      goForward();
-    } else if (prevState == ROTLEFT) {
-      delay(10);
-      rotLeft();
-    } else if (prevState == ROTRIGHT) {
-      delay(10);
-      rotRight();
-    }
-    goForward();
-    delay(5);
   }
   return false;
 }
+// boolean lineFollowingFrame() {
+//   int leftJudge = digitalRead(leftir);
+//   int midJudge = digitalRead(midir);
+//   int rightJudge = digitalRead(rightir);
+
+//   log("Line status: %s - %s - %s\n", leftJudge ? "off" : "on",
+//   midJudge ? "off" : "on", rightJudge ? "off" : "on");
+
+//   if(midJudge == 0) {
+//     digitalWrite(13, HIGH);
+//   } else {
+//     digitalWrite(13, LOW);
+//   }
+//   if (leftJudge == 1 && midJudge == 0 && rightJudge == 1) { // Back on line
+//     log("Back on line. Moving forward.\n");
+//     prevState = currState;
+//     currState = FORWARD;
+//     goForward();
+//     delay(10);
+//     stopDrive();
+//     delay(1);
+//   } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 1) { // On the right
+//     log("To the right.\n");
+//     prevState = currState;
+//     fineturnDirection(0);
+//   } else if (leftJudge == 0 && midJudge == 1 && rightJudge == 1) {
+//     log("To the right 2.\n");
+//     goForward();
+//     delay(5);
+//     stopDrive();
+//     delay(2);
+//     prevState = currState;
+//     fineturnDirection(0);
+//   } else if (leftJudge == 1 && midJudge == 0 && rightJudge == 0) {
+//     log("To the left.\n");
+//     prevState = currState;
+//     fineturnDirection(1);
+//   } else if (leftJudge == 1 && midJudge == 1 && rightJudge == 0) {
+//     log("To the left 2.\n");
+//     goForward();
+//     delay(5);
+//     stopDrive();
+//     delay(2);
+//     prevState = currState;
+//     fineturnDirection(1);
+//   } else if (leftJudge == 1 && rightJudge == 1 && midJudge == 1) {
+//     log("No line.\n");
+//     // Out of line, recover, and potentially we want to check for wall following now
+//     if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
+//       return true;
+//     } else {
+//       // Not following wall and out of line
+//       stopDrive();
+//       delay(10);
+//       if (prevState == FORWARD) {
+//         rotLeft();  // TODO: better return logic;
+//         delay(20);
+//       } else if (prevState == ROTLEFT) {
+//         rotRight();
+//         delay(20);
+//       } else if (prevState == ROTRIGHT) {
+//         rotLeft();
+//         delay(20);
+//       }
+//     }
+//   } else {  // 000 010
+//     log("??\n");
+//     if (prevState == FORWARD) {
+//       delay(10);
+//       goForward();
+//     } else if (prevState == ROTLEFT) {
+//       delay(10);
+//       rotLeft();
+//     } else if (prevState == ROTRIGHT) {
+//       delay(10);
+//       rotRight();
+//     }
+//     goForward();
+//     delay(5);
+//   }
+//   return false;
+// }
 
 boolean wallFollowingFrame() {
-  double frontLeftReading = read_ultrasonic(trig2, echo2);
-  double rightReading = read_ultrasonic(trig1, echo1);
+  double frontLeftReading = read_ultrasonic(trig2, echo2, 30000UL);
+  double rightReading = read_ultrasonic(trig1, echo1, 30000UL);
   int leftJudge = digitalRead(leftir);
   int midJudge = digitalRead(midir);
   int rightJudge = digitalRead(rightir);
 
   float e = dRef - rightReading;
-  if (frontLeftReading < 20) {
-    rotLeft();
-    delay(10);
-    return false;
+  if (frontLeftReading < FRONT_MIN) {
+    if (rightReading > 130) {
+      rotRightTotal();
+      delay(100);    // rotate for a fixed time
+      stopDrive();   // stop rotation
+    } else {
+      rotLeftTotal();
+      delay(100);    // rotate for a fixed time
+      stopDrive();   // stop rotation
+    }
+    return false;  // then next loop PD will take over again
   } else {
-    float de = (eCurr - ePrev) / tS;
+    if (fabs(e) < 1.5) e = 0.0f;  // use absolute value
+    float de = (e - ePrev) / tS;
     float u_raw = kP * e + kD * de;
 
-    if (u_raw > 40)  u_raw = 40;
-    if (u_raw < -40) u_raw = -40;
+    if (u_raw > 30) u_raw = 30;
+    if (u_raw < -30) u_raw = -30;
 
-    left_pwm  = constrain(left_pwm,  0, 255);
+    left_pwm = base_pwm + (int)u_raw;
+    right_pwm = base_pwm - (int)u_raw;
+    left_pwm = constrain(left_pwm, 0, 255);
     right_pwm = constrain(right_pwm, 0, 255);
 
-    drive(LOW, HIGH, LOW, HIGH, left_pwm, right_pwm);
+    drive(LOW, HIGH, LOW, HIGH, right_pwm, left_pwm);
+    ePrev = e;
   }
   if (objectFollowingCriteria(leftJudge, midJudge, rightJudge, frontLeftReading, rightReading)) {
     stopDrive();
@@ -525,8 +655,10 @@ boolean objectFollowingFrame() {
   return false;
 }
 
-boolean objectFollowingCriteria(int IR1, int IR2, int IR3, int sonic1, int sonic2) {
-  if ((ir1 == 0 || ir2 == 0 || ir3 == 0) && sonic1 > 100) { 
+boolean objectFollowingCriteria(int ir1, int ir2, int ir3, int sonic1, int sonic2) {
+  return false;
+  if (ir2 == 0 && sonic1 > 100) {
+    // ir1 and 3 get triggered when hits wall...
     // hit marker and front sonic reads high
     return true;
   } else {
@@ -537,6 +669,7 @@ boolean objectFollowingCriteria(int IR1, int IR2, int IR3, int sonic1, int sonic
 void wifiHandler(WiFiClient client) {
   String req = client.readStringUntil('\r');
   client.readStringUntil('\n');
+  log("WiFi request\n");
 
   if (req.startsWith("GET /api/cmd")) {
     int bIndex = req.indexOf("b=");
@@ -546,8 +679,10 @@ void wifiHandler(WiFiClient client) {
         switch (val) {
           case 50:
             if (systemState == MANUAL) {
+              log("Start autonomous.");
               systemState = AUTONOMOUS;
             } else {
+              log("Start manual.");
               stopDrive();
               systemState = MANUAL;
             }
@@ -571,6 +706,7 @@ void wifiHandler(WiFiClient client) {
             rotRight();
             break;
           case 255:  //Wall following
+            servo1.write(90);
             stopDrive();
             autoState = WALL;
             break;
@@ -596,6 +732,8 @@ void wifiHandler(WiFiClient client) {
           case 7:
             stopDrive();
             break;
+          case 150:
+            inhibitMovement = !inhibitMovement;
           default:
             break;
         }
@@ -629,6 +767,10 @@ void wifiHandler(WiFiClient client) {
     client.print(frontDistance);
     client.print(",\"sideDistance\":");
     client.print(sideDistance);
+    client.print(",\"left_pwm\":");
+    client.print(left_pwm);
+    client.print(",\"right_pwm\":");
+    client.print(right_pwm);
     client.print("}");
   } else if (req.startsWith("GET /api/swap")) {
     servo1.write(0);
@@ -710,15 +852,17 @@ void paramDrive(MotorParam d) {
   return;
 }
 void drive(PinStatus p1, PinStatus p2, PinStatus p3, PinStatus p4, int power1, int power2) {
-  analogWrite(enA_1, power1);
-  analogWrite(enA_2, power2);
+  if (!inhibitMovement) {
+    analogWrite(enA_1, power1);
+    analogWrite(enA_2, power2);
 
-  digitalWrite(in1_1, p3);
-  digitalWrite(in2_1, p4);
+    digitalWrite(in1_1, p3);
+    digitalWrite(in2_1, p4);
 
-  digitalWrite(in1_2, p1);
-  digitalWrite(in2_2, p2);
-  return;
+    digitalWrite(in1_2, p1);
+    digitalWrite(in2_2, p2);
+    return;
+  }
 }
 
 double read_ultrasonic(int trigPin, int echoPin, unsigned long timeout) {
@@ -765,10 +909,13 @@ void stopDrive() {
   drive(LOW, LOW, LOW, LOW, 0, 0);
 }
 void goForward() {
-  drive(LOW, HIGH, LOW, HIGH, 152, 152);
+  drive(LOW, HIGH, LOW, HIGH, 155, 155);
 }
 void goBackward() {
-  drive(HIGH, LOW, HIGH, LOW, 120, 120);
+  drive(HIGH, LOW, HIGH, LOW, 134, 134);
+}
+void fullBackward() {
+  drive(HIGH, LOW, HIGH, LOW, 200, 200);
 }
 
 // Division over all elements
