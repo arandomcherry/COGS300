@@ -258,7 +258,7 @@ float ePrev;  // e[k-1], e[k] should be measured by loop
 float kP = 5.0f;
 float kD = 1.2f;
 int base_pwm = 80;
-float tS = 0.05f;  // 0.05s
+float tS = 0.08f;  // 0.05s
 float dRef = 18.0;     // 10cm
 float dK;
 float uK;
@@ -318,7 +318,7 @@ void setup() {
   }
   systemState = MANUAL;
   autoState = LINE;
-  objTrackingTranslationTable[0][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 400 };
+  objTrackingTranslationTable[0][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 100 };
   objTrackingTranslationTable[0][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
   objTrackingTranslationTable[1][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 280 };
   objTrackingTranslationTable[1][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
@@ -374,6 +374,7 @@ void loop() {
         if (wallFollowingFrame()) {
           autoState = OBJECT;
           servo1.write(0);
+          delay(300);
         }
         break;
       case OBJECT:
@@ -406,6 +407,10 @@ void blinkBuiltinLED() {
 
 boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
   if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
+    stopDrive();
+    delay(40);
+    goForward();
+    delay(1500);
     return true;
   } 
   stopDrive();
@@ -470,7 +475,7 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
       continue;
     } else if (midJudge == 1 && leftJudge == 1 && rightJudge == 1) {
       goBackward();
-      delay(80);
+      delay(50);
       stopDrive();
       continue;
     }
@@ -528,6 +533,10 @@ boolean lineFollowingFrame() {
       stopDrive();
       delay(20);
       if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
+        stopDrive();
+        delay(40);
+        goForward();
+        delay(1500);
         return true;
       } else {
         // Not following wall and out of line
@@ -548,88 +557,6 @@ boolean lineFollowingFrame() {
   }
   return false;
 }
-// boolean lineFollowingFrame() {
-//   int leftJudge = digitalRead(leftir);
-//   int midJudge = digitalRead(midir);
-//   int rightJudge = digitalRead(rightir);
-
-//   log("Line status: %s - %s - %s\n", leftJudge ? "off" : "on",
-//   midJudge ? "off" : "on", rightJudge ? "off" : "on");
-
-//   if(midJudge == 0) {
-//     digitalWrite(13, HIGH);
-//   } else {
-//     digitalWrite(13, LOW);
-//   }
-//   if (leftJudge == 1 && midJudge == 0 && rightJudge == 1) { // Back on line
-//     log("Back on line. Moving forward.\n");
-//     prevState = currState;
-//     currState = FORWARD;
-//     goForward();
-//     delay(10);
-//     stopDrive();
-//     delay(1);
-//   } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 1) { // On the right
-//     log("To the right.\n");
-//     prevState = currState;
-//     fineturnDirection(0);
-//   } else if (leftJudge == 0 && midJudge == 1 && rightJudge == 1) {
-//     log("To the right 2.\n");
-//     goForward();
-//     delay(5);
-//     stopDrive();
-//     delay(2);
-//     prevState = currState;
-//     fineturnDirection(0);
-//   } else if (leftJudge == 1 && midJudge == 0 && rightJudge == 0) {
-//     log("To the left.\n");
-//     prevState = currState;
-//     fineturnDirection(1);
-//   } else if (leftJudge == 1 && midJudge == 1 && rightJudge == 0) {
-//     log("To the left 2.\n");
-//     goForward();
-//     delay(5);
-//     stopDrive();
-//     delay(2);
-//     prevState = currState;
-//     fineturnDirection(1);
-//   } else if (leftJudge == 1 && rightJudge == 1 && midJudge == 1) {
-//     log("No line.\n");
-//     // Out of line, recover, and potentially we want to check for wall following now
-//     if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
-//       return true;
-//     } else {
-//       // Not following wall and out of line
-//       stopDrive();
-//       delay(10);
-//       if (prevState == FORWARD) {
-//         rotLeft();  // TODO: better return logic;
-//         delay(20);
-//       } else if (prevState == ROTLEFT) {
-//         rotRight();
-//         delay(20);
-//       } else if (prevState == ROTRIGHT) {
-//         rotLeft();
-//         delay(20);
-//       }
-//     }
-//   } else {  // 000 010
-//     log("??\n");
-//     if (prevState == FORWARD) {
-//       delay(10);
-//       goForward();
-//     } else if (prevState == ROTLEFT) {
-//       delay(10);
-//       rotLeft();
-//     } else if (prevState == ROTRIGHT) {
-//       delay(10);
-//       rotRight();
-//     }
-//     goForward();
-//     delay(5);
-//   }
-//   return false;
-// }
 
 boolean wallFollowingFrame() {
   double frontLeftReading = read_ultrasonic(trig2, echo2, 30000UL);
@@ -642,21 +569,21 @@ boolean wallFollowingFrame() {
   if (frontLeftReading < FRONT_MIN) {
     if (rightReading > 130) {
       rotRightTotal();
-      delay(100);    // rotate for a fixed time
+      delay(150);    // rotate for a fixed time
       stopDrive();   // stop rotation
     } else {
       rotLeftTotal();
-      delay(100);    // rotate for a fixed time
+      delay(150);    // rotate for a fixed time
       stopDrive();   // stop rotation
     }
     return false;  // then next loop PD will take over again
   } else {
-    if (fabs(e) < 1.5) e = 0.0f;  // use absolute value
+    if (fabs(e) < 2.5) e = 0.0f;
     float de = (e - ePrev) / tS;
     float u_raw = kP * e + kD * de;
 
-    if (u_raw > 30) u_raw = 30;
-    if (u_raw < -30) u_raw = -30;
+    if (u_raw > 20) u_raw = 20;
+    if (u_raw < -20) u_raw = -20;
 
     left_pwm = base_pwm + (int)u_raw;
     right_pwm = base_pwm - (int)u_raw;
@@ -684,10 +611,6 @@ boolean wallFollowingCriteria() {
   double rightReading = read_ultrasonic(trig1, echo1);
 
   if ((frontLeftReading + rightReading < 60) || rightReading < 20 || frontLeftReading < 20) {
-    stopDrive();
-    delay(80);
-    goForward();
-    delay(1000);
     return true;
   } else {
     return false;
@@ -724,7 +647,6 @@ boolean objectFollowingFrame() {
 }
 
 boolean objectFollowingCriteria(int ir1, int ir2, int ir3, int sonic1, int sonic2) {
-  return false;
   if (ir2 == 0 && sonic1 > 100) {
     // ir1 and 3 get triggered when hits wall...
     // hit marker and front sonic reads high
@@ -846,9 +768,9 @@ void wifiHandler(WiFiClient client) {
     for (int i = 0; i < numPositionDebug; i++) {
       int angle = i * servoStepDebug;
       servo1.write(angle);
-      delay(80);
+      delay(40);
       objDistanceDebug[i] = read_ultrasonic(trig2, echo2, 100000UL);
-      delay(80);
+      delay(40);
     }
     double maxVal = arr_max(objDistanceDebug, numPositionDebug);
     if (maxVal < 0.0001) maxVal = 1.0;
