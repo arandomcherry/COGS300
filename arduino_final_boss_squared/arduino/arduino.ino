@@ -6,10 +6,10 @@
 // Motors, notice that there is a swap in drive() due to wiring mistake.
 #define enA_1 10
 #define enA_2 11
-#define in1_1 A0
-#define in2_1 4
-#define in1_2 7
-#define in2_2 8
+#define in1_1 4
+#define in2_1 A0
+#define in1_2 8
+#define in2_2 7
 // Servo
 #define servopin 12
 // Ultrasonics, 1 is leftside, 2 is frontside.
@@ -19,7 +19,7 @@
 #define echo2 9
 // IR Sensors
 #define leftir 2
-#define midir A1
+#define midir A3
 #define rightir 3
 
 // syslog
@@ -52,6 +52,8 @@ button.on{background:#cfe8ff;border-color:#7aa}
 .heatmap{display:flex;gap:2px;align-items:flex-end;margin-top:4px}
 .heatcell{flex:1;height:28px;border-radius:3px;background:#eee;transition:background .15s}
 #heatmapLegend{font-size:11px;color:#666;margin-top:4px}
+.heatcell.obj{outline:2px solid #999;}
+.heatcell.obj-main{outline:2px solid #000;}
 </style>
 <script>
 const C={W:1,A:4,S:2,D:5,Q:8,E:9,STOP:7,M:255,N:254,B:101,X:100,Z:50,I:150},p=new Set,m=new Set("WASD"),B={};
@@ -76,52 +78,93 @@ function ensureHeatmap(count){
     box.appendChild(cell);
   }
 }
-function renderHeatmap(values){
-  const box=document.getElementById("heatmap");
-  if(!box||!values.length)return;
+
+function renderHeatmap(values, objects){
+  const box = document.getElementById("heatmap");
+  if(!box || !values || !values.length) return;
   ensureHeatmap(values.length);
 
-  let min=values[0],max=values[0];
-  for(const v of values){
-    if(!Number.isFinite(v))continue;
-    if(v<min)min=v;
-    if(v>max)max=v;
-  }
-  const span=(max-min)||1;
+  const CLAMP_MAX = 200;
+  const cells = [...box.children];
 
-  // Left (index 0) → servo at 0°, right → 180°
-  const cells=[...box.children];
-  cells.forEach((cell,idx)=>{
-    const v=values[idx];
-    if(!Number.isFinite(v)){
-      cell.style.background="#eee";
-      return;
-    }
-    // Normalize 0–1
-    const t=(v-min)/span;
-    // We want **closer = darker**:
-    // If your values are normalized (0=near, 1=far), flip t first:
-    //   const closeness = 1 - t;
-    // If values are raw cm (small=near), closeness = 1 - t still works.
-    const closeness=1-t;
-    const lightness=80-closeness*40; // 40% (very close) → 80% (far)
-    cell.style.backgroundColor=`hsl(210,70%,${lightness}%)`;
+  // reset classes & titles
+  cells.forEach(cell=>{
+    cell.classList.remove("obj","obj-main");
+    cell.style.backgroundColor = "";
+    cell.removeAttribute("title");
   });
 
-  const legend=document.getElementById("heatmapLegend");
-  if(legend){
-    legend.textContent=
-      `min: ${min.toFixed(1)}  max: ${max.toFixed(1)}  (darker = closer, left = servo 0°)`;
+  // distance → color (same idea as before)
+  cells.forEach((cell, idx) => {
+    const raw = values[idx];
+    if(!Number.isFinite(raw)) {
+      cell.style.background = "#eee";
+      return;
+    }
+
+    const d = Math.min(raw, CLAMP_MAX);   // clamp 0–200
+
+    // Nonlinear emphasis on close distances
+    const t = Math.exp(-d / 60);          // 0 cm → 1, 200 cm → small
+
+    // Map t (0–1) into a color scale: far → blue, near → red
+    const hue = (1 - t) * 240;
+    const sat = 85;
+    const light = 50 + (1 - t) * 10;
+
+    cell.style.backgroundColor = `hsl(${hue},${sat}%,${light}%)`;
+  });
+
+  // Overlay object segments
+  if (Array.isArray(objects)) {
+    objects.forEach((obj, idx) => {
+      const start = (obj.start != null ? obj.start : 0) | 0;
+      const end   = (obj.end   != null ? obj.end   : start) | 0;
+
+      const parts = [`object #${idx}`];
+      if (typeof obj.closest === "number") parts.push(`closest≈${obj.closest.toFixed(1)}cm`);
+      if (typeof obj.width   === "number") parts.push(`width≈${obj.width.toFixed(1)}cm`);
+      const label = parts.join(", ");
+
+      for (let i = start; i <= end && i < cells.length; i++) {
+        const cell = cells[i];
+        if (!cell) continue;
+        cell.classList.add("obj");
+        if (obj.isBest || idx === 0) cell.classList.add("obj-main");
+        cell.title = label;
+      }
+    });
+  }
+
+  const legend = document.getElementById("heatmapLegend");
+  if (legend) {
+    const finite = values.filter(v => Number.isFinite(v));
+    if (!finite.length) {
+      legend.textContent = "No valid readings.";
+    } else {
+      const min = Math.min(...finite);
+      const max = Math.max(...finite);
+      legend.textContent =
+        `Swapscan: ${finite.length} samples, min=${min.toFixed(1)}cm, max=${max.toFixed(1)}cm. ` +
+        `Warm = close. Bold outline = chosen object.`;
+    }
   }
 }
 function swapScan(){
   fetch("/api/swap").then(r=>r.json()).then(s=>{
     const stateEl=document.getElementById("state");
     if(stateEl) stateEl.textContent=JSON.stringify(s,null,2);
-    if(typeof s.result==="string"){
-      const vals=s.result.trim().split(/\s+/).map(Number).filter(v=>Number.isFinite(v));
-      if(vals.length) renderHeatmap(vals);
+
+    // Prefer the new structured array, fall back to old string if present
+    let vals = [];
+    if (Array.isArray(s.distances)) {
+      vals = s.distances;
+    } else if (typeof s.result === "string") {
+      vals = s.result.trim().split(/\s+/).map(Number).filter(v=>Number.isFinite(v));
     }
+
+    const objs = Array.isArray(s.objects) ? s.objects : [];
+    if (vals.length) renderHeatmap(vals, objs);
   }).catch(()=>{});
 }
 addEventListener("keydown",e=>{const k=e.key.toUpperCase();if(C[k]){e.preventDefault();d(k)}})
@@ -222,12 +265,12 @@ MovState currState = FORWARD;
 
 Servo servo1;  // The servo for the front ultrasonic sonar
 
-const int numPosition = 9;        // For object tracking. Number of positions to check and navigate.
-const int numPositionDebug = 30;
+const int numPosition = 36;  // For object tracking. Number of positions to check and navigate.
+const int numPositionDebug = 36;
 volatile int servoDirection = 0;  // Current direction for servo (front ultrasonic) to take.
-volatile int servoDirectionDebug = 0; 
-double servoStep;                    // The amount of angle for each step for object tracking
-double servoStepDebug;                    
+volatile int servoDirectionDebug = 0;
+double servoStep;  // The amount of angle for each step for object tracking
+double servoStepDebug;
 
 // All parameters needed for driving
 struct MotorParam {
@@ -245,26 +288,143 @@ struct MotorParamDelayed {
   int delay;
 };
 MotorParamDelayed objTrackingTranslationTable[numPosition][2];
+const int MAX_OBJECTS = 6;
+int num_objects = 0;
+struct visibleObj {
+  int startingIndex;
+  int endingIndex;
+  int closestIndex;
+  double closestDist;
+};
+visibleObj visibleObjects[MAX_OBJECTS];
+
+double actualSize(int startInd, int endingInd, double closestDist) {
+  int count = endingInd - startInd + 1;     // number of beam directions
+  double angleDeg = count * 5.0;            // each index = 5 degrees
+  double angleRad = angleDeg * PI / 180.0;  // convert to radians
+
+  // Width = 2 * sin(angle/2) / d
+  return 2.0 * sin(angleRad / 2.0) / closestDist ;
+}
+
+int bestObject(visibleObj* visibleObjs) {
+  double score = 0;
+  int r = 0;
+  for (int i = 0; i < num_objects; i++) {
+    double newScore = actualSize(visibleObjs[i].startingIndex, visibleObjs[i].endingIndex, visibleObjs[i].closestDist);
+    if (newScore > score) {
+      score = newScore;
+      r = i;
+    }
+  }
+  return r;
+}
+
+void distanceToVisibleObjects(double* dist, int distN, visibleObj* v) {
+  num_objects = 0;
+  if (!dist || distN <= 0) return;
+
+  const double FAR_SENTINEL = 9000.0;  // anything >= this is "no hit"
+
+  // 1) Average over valid readings only
+  double sum = 0.0;
+  int count = 0;
+  for (int i = 0; i < distN; ++i) {
+    double d = dist[i];
+    if (d > 0.0 && d < FAR_SENTINEL) {
+      sum += d;
+      ++count;
+    }
+  }
+
+  if (count == 0) {
+    // no valid readings -> no objects
+    return;
+  }
+
+  double distAvg = sum / count;
+  double threshold = distAvg;  // you can tweak this, e.g. distAvg * 1.1
+
+  int i = 0;
+  while (i < distN) {
+    double d = dist[i];
+
+    // Start of an "object" = close + valid
+    if (d > 0.0 && d < FAR_SENTINEL && d <= threshold) {
+      int start = i;
+      double closest = d;
+      int closestIdx = i;
+
+      // advance until segment ends
+      while (i < distN) {
+        double d2 = dist[i];
+        if (!(d2 > 0.0 && d2 < FAR_SENTINEL && d2 <= threshold)) break;
+        if (d2 < closest) {
+          closest = d2;
+          closestIdx = i;
+        }
+        ++i;
+      }
+      int end = i - 1;
+
+      visibleObj candidate;
+      candidate.startingIndex = start;
+      candidate.endingIndex = end;
+      candidate.closestIndex = closestIdx;
+      candidate.closestDist = closest;
+
+      if (num_objects < MAX_OBJECTS) {
+        v[num_objects++] = candidate;
+      } else {
+        // replace smallest-width object if this one is bigger
+        int smallestIdx = 0;
+        double smallestSize = actualSize(
+          v[0].startingIndex, v[0].endingIndex, v[0].closestDist);
+
+        for (int k = 1; k < MAX_OBJECTS; ++k) {
+          double s = actualSize(
+            v[k].startingIndex, v[k].endingIndex, v[k].closestDist);
+          if (s < smallestSize) {
+            smallestSize = s;
+            smallestIdx = k;
+          }
+        }
+
+        double newSize = actualSize(
+          candidate.startingIndex, candidate.endingIndex, candidate.closestDist);
+
+        if (newSize > smallestSize) {
+          v[smallestIdx] = candidate;
+        }
+      }
+
+    } else {
+      ++i;
+    }
+  }
+}
+
+
 double objDistance[numPosition];
 double objProbability[numPosition];
 double objDistanceDebug[numPositionDebug];
 double objProbabilityDebug[numPositionDebug];
 
-volatile int leftIRVal;
-volatile int rightIRVal;
+volatile byte leftIRVal;
+volatile byte rightIRVal;
 
 // Wall-following PD Controller parameters
 float ePrev;  // e[k-1], e[k] should be measured by loop
-float kP = 5.0f;
-float kD = 1.2f;
-int base_pwm = 80;
-float tS = 0.08f;  // 0.05s
-float dRef = 18.0;     // 10cm
+float kP = 3.4f;
+float kD = 0.8f;
+int base_pwm = 90;
+float tS = 0.1f;
+float dRef = 16.0;
 float dK;
 float uK;
 int left_pwm;
 int right_pwm;
-const float FRONT_MIN = 10;  // cm: "we're about to hit front wall"
+const float FRONT_MIN = 12;  // cm: "we're about to hit front wall"
 const float RIGHT_MIN = 4;   // cm: "we're scraping right wall"
 
 void syslog(char* msg, size_t len) {
@@ -318,23 +478,23 @@ void setup() {
   }
   systemState = MANUAL;
   autoState = LINE;
-  objTrackingTranslationTable[0][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 100 };
-  objTrackingTranslationTable[0][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
-  objTrackingTranslationTable[1][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 280 };
-  objTrackingTranslationTable[1][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
-  objTrackingTranslationTable[2][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 220 };
-  objTrackingTranslationTable[2][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
-  objTrackingTranslationTable[3][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 170 };
-  objTrackingTranslationTable[3][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
-  objTrackingTranslationTable[4][0] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
+  objTrackingTranslationTable[0][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 215 };
+  objTrackingTranslationTable[0][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 210 };
+  objTrackingTranslationTable[1][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 155 };
+  objTrackingTranslationTable[1][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 240 };
+  objTrackingTranslationTable[2][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 100 };
+  objTrackingTranslationTable[2][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 240 };
+  objTrackingTranslationTable[3][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 70 };
+  objTrackingTranslationTable[3][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 260 };
+  objTrackingTranslationTable[4][0] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 300 };
   objTrackingTranslationTable[4][1] = { { LOW, LOW, LOW, LOW, 0, 0 }, 0 };
-  objTrackingTranslationTable[5][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 100 };
-  objTrackingTranslationTable[5][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
-  objTrackingTranslationTable[6][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 160 };
-  objTrackingTranslationTable[6][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
-  objTrackingTranslationTable[7][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 230 };
-  objTrackingTranslationTable[7][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
-  objTrackingTranslationTable[8][0] = { { LOW, HIGH, HIGH, LOW, 160, 160 }, 300 };
+  objTrackingTranslationTable[5][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 140 };
+  objTrackingTranslationTable[5][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 260 };
+  objTrackingTranslationTable[6][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 185 };
+  objTrackingTranslationTable[6][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 240 };
+  objTrackingTranslationTable[7][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 230 };
+  objTrackingTranslationTable[7][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 210 };
+  objTrackingTranslationTable[8][0] = { { HIGH, LOW, LOW, HIGH, 160, 160 }, 250 };
   objTrackingTranslationTable[8][1] = { { LOW, HIGH, LOW, HIGH, 133, 133 }, 200 };
 
   pinMode(enA_1, OUTPUT);
@@ -409,29 +569,21 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
   if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
     stopDrive();
     delay(40);
-    goForward();
-    delay(1500);
+    drive(LOW, HIGH, LOW, HIGH, 100, 100);
+    delay(500);
     return true;
-  } 
+  }
   stopDrive();
   delay(20);
-  int counter = 0;  // Force quit on 200000;
   while (true) {
-    counter++;
-    if (counter >= 20000) {
-      goForward();
-      delay(10);
-      stopDrive();
-      return 0;
-    }
     if (!direction) {
       rotLeft();
-      delay(3);
+      delay(5);
       stopDrive();
       currState = ROTLEFT;
     } else {
       rotRight();
-      delay(3);
+      delay(5);
       stopDrive();
       currState = ROTRIGHT;
     }
@@ -448,15 +600,13 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
     if (leftJudge == 1 && midJudge == 0 && rightJudge == 1) {  // back on line
       stopDrive();
       if (!direction) {
-        rotRight();
-        delay(5);
-        stopDrive();
+        haltRight();
       } else {
-        rotLeft();
-        delay(5);
-        stopDrive();
+        haltLeft();
       }
-      goForward();
+      delay(30);
+      drive(LOW, HIGH, LOW, HIGH, 144, 144);
+      delay(17);
       return false;
     } else if (leftJudge == 1 && rightJudge == 0) {
       if (!direction) {
@@ -474,8 +624,8 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
     } else if (leftJudge == 0 && midJudge == 0 && rightJudge == 0) {
       continue;
     } else if (midJudge == 1 && leftJudge == 1 && rightJudge == 1) {
-      goBackward();
-      delay(50);
+      goBackwardStrong();
+      delay(64);
       stopDrive();
       continue;
     }
@@ -483,19 +633,27 @@ boolean fineturnDirection(bool direction) {  // 0 = left, 1 = right
 }
 
 void rotLeft() {
-  drive(LOW, HIGH, HIGH, LOW, 0, 84);
+  drive(LOW, HIGH, HIGH, LOW, 0, 100); 
 }
 
 void rotRight() {
-  drive(HIGH, LOW, LOW, HIGH, 84, 0);
+  drive(HIGH, LOW, LOW, HIGH, 100, 0);
+}
+
+void haltLeft() {
+  drive(LOW, HIGH, HIGH, LOW, 0, 255);
+}
+
+void haltRight() {
+  drive(HIGH, LOW, LOW, HIGH, 255, 0);
 }
 
 void rotLeftTotal() {
-  drive(LOW, HIGH, HIGH, LOW, 90, 90);
+  drive(LOW, HIGH, HIGH, LOW, 110, 110);
 }
 
 void rotRightTotal() {
-  drive(HIGH, LOW, LOW, HIGH, 90, 90);
+  drive(HIGH, LOW, LOW, HIGH, 110, 110);
 }
 
 void IRInterrupt() {
@@ -528,29 +686,29 @@ boolean lineFollowingFrame() {
       return fineturnDirection(0);
     } else if (rightIRVal == 0) {
       prevState = currState;
-     return  fineturnDirection(1);
+      return fineturnDirection(1);
     } else {  // 1 1 1
       stopDrive();
-      delay(20);
+      delay(10);
       if (systemState == AUTONOMOUS_SEQ && wallFollowingCriteria()) {
         stopDrive();
         delay(40);
-        goForward();
-        delay(1500);
+        drive(LOW, HIGH, LOW, HIGH, 100, 100);
+        delay(500);
         return true;
       } else {
         // Not following wall and out of line
         if (prevState == FORWARD) {
           goBackward();
-          delay(10);
+          delay(14);
         } else if (prevState == ROTLEFT) {
           currState = ROTRIGHT;
           rotRight();
-          delay(15);
+          delay(20);
         } else if (prevState == ROTRIGHT) {
           currState = ROTLEFT;
           rotLeft();
-          delay(15);
+          delay(20);
         }
       }
     }
@@ -559,45 +717,64 @@ boolean lineFollowingFrame() {
 }
 
 boolean wallFollowingFrame() {
-  double frontLeftReading = read_ultrasonic(trig2, echo2, 30000UL);
-  double rightReading = read_ultrasonic(trig1, echo1, 30000UL);
-  int leftJudge = digitalRead(leftir);
-  int midJudge = digitalRead(midir);
-  int rightJudge = digitalRead(rightir);
+  double frontLeftReading = read_ultrasonic(trig2, echo2, 20000UL);
+  double rightReading = read_ultrasonic(trig1, echo1, 20000UL);
 
   float e = dRef - rightReading;
   if (frontLeftReading < FRONT_MIN) {
     if (rightReading > 130) {
-      rotRightTotal();
-      delay(150);    // rotate for a fixed time
-      stopDrive();   // stop rotation
+      while (true) {
+        frontLeftReading = read_ultrasonic(trig2, echo2, 10000UL);
+        rotRightTotal();
+        delay(30); 
+        stopDrive();
+        delay(5);
+        if (frontLeftReading > FRONT_MIN) {
+          break;
+        }
+      }
     } else {
-      rotLeftTotal();
-      delay(150);    // rotate for a fixed time
-      stopDrive();   // stop rotation
+      while (true) {
+        frontLeftReading = read_ultrasonic(trig2, echo2, 10000UL);
+        rotLeftTotal();
+        delay(30); 
+        stopDrive();
+        delay(5);
+        if (frontLeftReading > FRONT_MIN) {
+          break;
+        }
+      }
     }
     return false;  // then next loop PD will take over again
   } else {
-    if (fabs(e) < 2.5) e = 0.0f;
+    if (fabs(e) < 2) e = 0.0f;
     float de = (e - ePrev) / tS;
     float u_raw = kP * e + kD * de;
 
-    if (u_raw > 20) u_raw = 20;
-    if (u_raw < -20) u_raw = -20;
+    if (u_raw > 35) u_raw = 35;
+    if (u_raw < -35) u_raw = -35;
 
-    left_pwm = base_pwm + (int)u_raw;
-    right_pwm = base_pwm - (int)u_raw;
+    left_pwm = base_pwm - (int)u_raw;
+    right_pwm = base_pwm + (int)u_raw - 12;
     left_pwm = constrain(left_pwm, 0, 255);
-    right_pwm = constrain(right_pwm, 0, 255);
+    right_pwm = constrain(right_pwm, 0, 233);
 
-    drive(LOW, HIGH, LOW, HIGH, right_pwm, left_pwm);
+    drive(LOW, HIGH, LOW, HIGH, left_pwm, right_pwm);
     ePrev = e;
   }
-  if (objectFollowingCriteria(leftJudge, midJudge, rightJudge, frontLeftReading, rightReading)) {
+  
+  int leftJudge = digitalRead(leftir);
+  int midJudge = digitalRead(midir);
+  int rightJudge = digitalRead(rightir);
+  if (systemState == AUTONOMOUS_SEQ && objectFollowingCriteria(leftJudge, midJudge, rightJudge, frontLeftReading, rightReading)) {
     stopDrive();
-    delay(10);
+    delay(20);
+    goBackward();
+    delay(200);
+    rotLeft();
+    delay(220);
     goForward();
-    delay(500);
+    delay(1100);
     stopDrive();
     return true;
   } else {
@@ -610,7 +787,7 @@ boolean wallFollowingCriteria() {
   double frontLeftReading = read_ultrasonic(trig2, echo2);
   double rightReading = read_ultrasonic(trig1, echo1);
 
-  if ((frontLeftReading + rightReading < 60) || rightReading < 20 || frontLeftReading < 20) {
+  if ((frontLeftReading + rightReading < 60) || rightReading < 16 || frontLeftReading < 20) {
     return true;
   } else {
     return false;
@@ -619,22 +796,28 @@ boolean wallFollowingCriteria() {
 
 boolean objectFollowingFrame() {
   // Sweeping
-  servo1.write(0);
-  delay(500);
+  num_objects = 0;
+  servo1.write(180);
+  delay(800);
   for (int i = 0; i < numPosition; i++) {
-    int angle = i * servoStep;
+    int angle = 180 - i * servoStep;
     servo1.write(angle);
-    delay(200);
-    objDistance[i] = read_ultrasonic(trig2, echo2, 50000UL);
-    if (objDistance[i] < 6) {
-      return true;
-    }
+    delay(30);
+    double tmp = read_ultrasonic(trig2, echo2, 10000UL);
+    if (tmp > 500) tmp = 100;
+    objDistance[i] = tmp;
+    delay(30);
   }
-  double maxVal = arr_max(objDistance, numPosition);
-  if (maxVal < 0.0001) maxVal = 1.0;
-  arr_div(objDistance, numPosition, maxVal);
-  arr_mirror1(objDistance, objProbability, numPosition);
-  int bestIndex = arr_maxi(objProbability, numPosition);
+  // double maxVal = arr_max(objDistance, numPosition);
+  // if (mashi quxVal < 0.0001) maxVal = 1.0;
+  // arr_div(objDistance, numPosition, maxVal);
+  // arr_mirror1(objDistance, objProbability, numPosition);
+  // int bestIndex = arr_maxi(objProbability, numPosition);
+  distanceToVisibleObjects(objDistance, numPosition, visibleObjects);
+  int bestObj = bestObject(visibleObjects);
+  int bestClosestIdx = visibleObjects[bestObj].closestIndex;
+  int bestIndex = bestClosestIdx / 4;
+
   if (objTrackingTranslationTable[bestIndex][0].delay != 0) {
     delayedDrive(objTrackingTranslationTable[bestIndex][0]);
   }
@@ -647,7 +830,7 @@ boolean objectFollowingFrame() {
 }
 
 boolean objectFollowingCriteria(int ir1, int ir2, int ir3, int sonic1, int sonic2) {
-  if (ir2 == 0 && sonic1 > 100) {
+  if ((ir1 == 0 && ir2 == 0 && ir3 == 0 && sonic1 > 100) && systemState == AUTONOMOUS_SEQ) {
     // ir1 and 3 get triggered when hits wall...
     // hit marker and front sonic reads high
     return true;
@@ -701,7 +884,7 @@ void wifiHandler(WiFiClient client) {
             autoState = WALL;
             break;
           case 254:  //Object following
-            servo1.write(0);
+            servo1.write(180);
             stopDrive();
             autoState = OBJECT;
             delay(100);
@@ -763,27 +946,107 @@ void wifiHandler(WiFiClient client) {
     client.print(right_pwm);
     client.print("}");
   } else if (req.startsWith("GET /api/swap")) {
-    servo1.write(0);
+    // Debug sweep with the front ultrasonic
+    servo1.write(180);
     delay(500);
     for (int i = 0; i < numPositionDebug; i++) {
-      int angle = i * servoStepDebug;
+      int angle = 180 - i * servoStepDebug;
       servo1.write(angle);
       delay(40);
-      objDistanceDebug[i] = read_ultrasonic(trig2, echo2, 100000UL);
+      double tmp = read_ultrasonic(trig2, echo2, 8000UL);
+      if (tmp > 500) tmp = 100;
+      objDistanceDebug[i] = tmp;
       delay(40);
     }
+
+    // Build per-beam probability like the object tracker (normalize + mirror)
     double maxVal = arr_max(objDistanceDebug, numPositionDebug);
     if (maxVal < 0.0001) maxVal = 1.0;
-    arr_div(objDistanceDebug, numPositionDebug, maxVal);
+    for (int i = 0; i < numPositionDebug; i++) {
+      // Normalized distance 0–1, then mirrored so closer → higher "prob"
+      objProbabilityDebug[i] = 1.0 - (objDistanceDebug[i] / maxVal);
+    }
+
+    // Run the same segmentation used by objectFollowingFrame()
+    distanceToVisibleObjects(objDistanceDebug, numPositionDebug, visibleObjects);
+    int localNumObjects = num_objects;  // distanceToVisibleObjects updates global num_objects
+
+    int bestObjIdx = -1;
+    int bestClosestIdx = -1;
+    int bestDriveIdx = -1;
+
+    if (localNumObjects > 0) {
+      bestObjIdx = bestObject(visibleObjects);
+      bestClosestIdx = visibleObjects[bestObjIdx].closestIndex;
+      bestDriveIdx = bestClosestIdx / 4;  // 0–8, matches objTrackingTranslationTable index
+    }
+
+    // JSON response
     client.println("HTTP/1.1 200 OK");
     client.println("Content-Type: application/json");
     client.println("Connection: close\r\n");
-    client.print("{\"result\":\"");
+
+    client.print("{\"numPositions\":");
+    client.print(numPositionDebug);
+
+    // Distances: left→right for the UI (index 0 = 180°, leftmost)
+    client.print(",\"distances\":[");
     for (int i = 0; i < numPositionDebug; i++) {
       client.print(objDistanceDebug[i]);
-      client.print(" ");
+      if (i < numPositionDebug - 1) client.print(",");
     }
-    client.print("\"}");
+    client.print("]");
+      
+
+    // Optional: keep old space-separated string for backwards compatibility
+    client.print(",\"result\":\"");
+    for (int i = 0; i < numPositionDebug; i++) {
+      client.print(objDistanceDebug[i]);
+     client.print(" ");
+    }
+    client.print("\"");
+
+
+    // Objects (segments) in both servo index space and heatmap cell space
+    client.print(",\"objects\":[");
+    for (int i = 0; i < localNumObjects; i++) {
+      int sIdx = visibleObjects[i].startingIndex;
+      int eIdx = visibleObjects[i].endingIndex;
+      double c = visibleObjects[i].closestDist;
+      double w = actualSize(sIdx, eIdx, c);
+
+      // Servo indices and heatmap indices now aligned: 0 = leftmost (180°)
+      int displayStart = sIdx;
+      int displayEnd   = eIdx;
+
+      client.print("{\"start\":");
+      client.print(displayStart);
+      client.print(",\"end\":");
+      client.print(displayEnd);
+      client.print(",\"servoStart\":");
+      client.print(sIdx);
+      client.print(",\"servoEnd\":");
+      client.print(eIdx);
+      client.print(",\"closest\":");
+      client.print(c);
+      client.print(",\"width\":");
+      client.print(w);
+      client.print(",\"isBest\":");
+      client.print((i == bestObjIdx) ? "true" : "false");
+      client.print("}");
+
+      if (i < localNumObjects - 1) client.print(",");
+    }
+    client.print("]");
+
+
+    // Indices of the chosen "best" object
+    client.print(",\"bestObject\":");
+    client.print(bestObjIdx);
+    client.print(",\"bestDriveIndex\":");
+    client.print(bestDriveIdx);
+
+    client.print("}");
   } else if (req.startsWith("GET /api/servo")) {
     int iPos = req.indexOf("i=");
     int idx = 0;
@@ -793,7 +1056,7 @@ void wifiHandler(WiFiClient client) {
     if (idx < 0) idx = 0;
     if (idx >= numPosition) idx = numPosition - 1;
 
-    int angle = idx * servoStep;
+    int angle = 180 - idx * servoStep;
     servo1.write(angle);
 
     client.println("HTTP/1.1 200 OK");
@@ -884,7 +1147,7 @@ double read_ultrasonic(int trigPin, int echoPin) {
   digitalWrite(trigPin, LOW);   // stop pulse
 
   // Measure length of time before pulse comes in
-  double duration = pulseIn(echoPin, HIGH, 18000UL);
+  double duration = pulseIn(echoPin, HIGH, 10000UL);
 
   // Convert the time into a distance
   double cm = (duration / 2) / 29.1;  // Divide by 29.1 or multiply by 0.0343
@@ -900,10 +1163,13 @@ void stopDrive() {
   drive(LOW, LOW, LOW, LOW, 0, 0);
 }
 void goForward() {
-  drive(LOW, HIGH, LOW, HIGH, 155, 155);
+  drive(LOW, HIGH, LOW, HIGH, 160, 160);
 }
 void goBackward() {
   drive(HIGH, LOW, HIGH, LOW, 134, 134);
+}
+void goBackwardStrong() {
+  drive(HIGH, LOW, HIGH, LOW, 150, 150);
 }
 void fullBackward() {
   drive(HIGH, LOW, HIGH, LOW, 200, 200);
@@ -936,6 +1202,20 @@ double arr_max(const double* arr, size_t n) {
     }
   }
   return mx;
+}
+
+// return the average
+double arr_avg(const double* arr, size_t n) {
+  if (arr == NULL || n == 0) {
+    return 0.0;  // or handle error as appropriate
+  }
+
+  double sum = 0.0;
+  for (size_t i = 0; i < n; ++i) {
+    sum += arr[i];
+  }
+
+  return sum / n;
 }
 
 // Convert every element to be 1 - x
